@@ -1,5 +1,5 @@
 # Tailnet ACL rendered from local.acl_machines — the UNION of live GCP machines
-# and machines outside this root (var.frozen_aws_machines). This root is the
+# and machines outside this root (var.external_machines). This root is the
 # SOLE writer of the tailnet policy document (overwrite_existing_content = true
 # rewrites the WHOLE document each apply).
 #

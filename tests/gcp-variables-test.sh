@@ -63,8 +63,8 @@ assert_contains 't2a|c4a|n4a' "$VARIABLES"
 assert_contains 'mname == "primary" ? uname : "${uname}-${mname}"' "$LOCALS"
 assert_contains 'mname == "primary" ? uname : "${uname}-${mname}"' "$VARIABLES"
 
-# frozen_aws_machines must reject keys colliding with flattened dev keys.
-assert_contains 'variable "frozen_aws_machines"' "$VARIABLES"
+# external_machines must reject keys colliding with flattened dev keys.
+assert_contains 'variable "external_machines"' "$VARIABLES"
 
 # VS Code's latest-at-create default must not force existing callers of the
 # shared toolchain object to provide a new field.

@@ -6,7 +6,7 @@ operations, offboarding, breakglass, and the quarterly restore drill.
 
 The Terraform root (`gcp/`) provisions every machine and is the **sole owner of
 the tailnet ACL** — the document it renders covers the machines in `var.devs`
-plus anything listed in `var.frozen_aws_machines` (machines managed outside
+plus anything listed in `var.external_machines` (machines managed outside
 this root that must keep tailnet access; empty for a fresh fleet). Devs reach
 their boxes as `ssh dev@<key>-devbox`.
 
@@ -163,7 +163,7 @@ terraform -chdir=gcp output -raw devbox_acl_json | jq .
 If your tailnet carries policy beyond devboxes, merge it into
 `gcp/tailscale-acl.tf` and re-preview until the rendered document is the
 policy you want. Machines managed outside this root that must keep access
-go in `frozen_aws_machines`.
+go in `external_machines`.
 
 While the gate is closed, `devs` is forced to `{}` (`gcp/variables.tf` rejects
 anything else — a machine cannot join the tailnet before its tag-owner

@@ -23,7 +23,7 @@ variables {
     aws_cli_install_sha256      = "1111111111111111111111111111111111111111111111111111111111111111"
   }
 
-  frozen_aws_machines = {
+  external_machines = {
     admin-a = "admin-a@example.test"
     admin-b = "admin-b@example.test"
     member  = "member@example.test"
@@ -86,7 +86,7 @@ run "empty_fleet_has_no_empty_destinations" {
   command = plan
 
   variables {
-    frozen_aws_machines = {}
+    external_machines = {}
   }
 
   assert {

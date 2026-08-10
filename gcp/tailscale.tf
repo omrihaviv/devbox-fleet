@@ -1,5 +1,5 @@
 # Reusable, 24h-TTL, pre-authorized, NON-ephemeral auth keys — one per GCP
-# machine (frozen_aws_machines entries keep their externally-managed keys).
+# machine (external_machines entries keep their externally-managed keys).
 #   reusable=true : a bootstrap retry within the TTL re-consumes the same key.
 #   expiry=86400  : leaked-key window ≤ one working day.
 #   ephemeral=false: /var/lib/tailscale bind-mounts to /data, so node

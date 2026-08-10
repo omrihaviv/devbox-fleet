@@ -22,12 +22,12 @@ locals {
     }
   ]...)
 
-  # Union of live GCP machines and the machines in var.frozen_aws_machines,
+  # Union of live GCP machines and the machines in var.external_machines,
   # key → owner email.
   # This is the domain of every ACL construct: the GCP root is the SOLE
   # ACL writer and must render rules for machines it does not manage.
   acl_machines = merge(
     { for k, m in local.machines : k => m.tailscale_email },
-    var.frozen_aws_machines,
+    var.external_machines,
   )
 }

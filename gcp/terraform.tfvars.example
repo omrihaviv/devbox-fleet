@@ -62,7 +62,7 @@ devs                 = {}
 
 # Machines outside this root that must keep tailnet access (rare; empty for
 # a fresh fleet).
-frozen_aws_machines = {}
+external_machines = {}
 
 tailscale_admin_emails        = ["ops@example.com"]
 tailscale_oauth_client_id     = "REPLACE"

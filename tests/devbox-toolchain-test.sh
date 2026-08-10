@@ -789,6 +789,7 @@ test_matching_versions_are_noop() {
     DEVBOX_FSTAB="$workdir/fstab" \
     DEVBOX_DEV_HOME="$workdir/home" \
     DEVBOX_GCP_RUNTIME_BUCKET_FILE="$workdir/etc/devbox/runtime-bucket" \
+    DEVBOX_CONNECTORS_FILE="$workdir/etc/devbox-connectors.json" \
     DEVBOX_BOOTSTRAP_COMPLETE_FILE="$workdir/var/lib/devbox-bootstrap/complete" \
     DEVBOX_CODEX_REQUIRED_FILE="$workdir/var/lib/devbox-runtime/codex-cli-required" \
     DEVBOX_CODEX_SUCCESS_FILE="$workdir/var/lib/devbox-runtime/codex-cli-installed" \
@@ -889,6 +890,7 @@ test_containerd_migration() {
     DEVBOX_FSTAB="$workdir/fstab" \
     DEVBOX_DEV_HOME="$workdir/home" \
     DEVBOX_GCP_RUNTIME_BUCKET_FILE="$workdir/etc/devbox/runtime-bucket" \
+    DEVBOX_CONNECTORS_FILE="$workdir/etc/devbox-connectors.json" \
     DEVBOX_BOOTSTRAP_COMPLETE_FILE="$workdir/var/lib/devbox-bootstrap/complete" \
     DEVBOX_CODEX_REQUIRED_FILE="$workdir/var/lib/devbox-runtime/codex-cli-required" \
     DEVBOX_CODEX_SUCCESS_FILE="$workdir/var/lib/devbox-runtime/codex-cli-installed" \
@@ -1825,7 +1827,7 @@ test_paseo_daemon_reload_failure_is_retryable() {
     || fail "Paseo daemon reconciliation did not enable the service after retry"
 }
 
-test_paseo_success_marker_does_not_modify_frozen_aws_box() {
+test_paseo_success_marker_leaves_preinstalled_box_alone() {
   local workdir
   workdir="$(mktemp -d)"
   trap 'rm -rf "$workdir"' RETURN
@@ -1842,7 +1844,7 @@ test_paseo_success_marker_does_not_modify_frozen_aws_box() {
   run_paseo_step "$workdir"
 
   [ ! -e "$workdir/commands.log" ] \
-    || fail "success-marked AWS box received Paseo service management"
+    || fail "success-marked box received Paseo service management"
   [ ! -e "$workdir/usr/local/bin/devbox-paseo-daemon" ] \
     || fail "success-marked AWS box received the Paseo daemon runner"
   [ ! -e "$workdir/etc/systemd/system/paseo.service" ] \
@@ -2636,7 +2638,7 @@ test_paseo_new_gcp_bootstrap_installs_latest_and_writes_tailnet_config
 test_paseo_success_reconciles_boot_enabled_daemon
 test_paseo_daemon_runner_preserves_then_takes_over_detached_daemon
 test_paseo_daemon_reload_failure_is_retryable
-test_paseo_success_marker_does_not_modify_frozen_aws_box
+test_paseo_success_marker_leaves_preinstalled_box_alone
 test_paseo_existing_gcp_reconciles_daemon_without_reinstall_and_aws_skips
 test_paseo_failure_marker_retries_after_bootstrap
 test_paseo_tailscale_failure_retains_retry_marker

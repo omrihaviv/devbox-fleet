@@ -199,28 +199,28 @@ variable "devs" {
   }
 }
 
-variable "frozen_aws_machines" {
+variable "external_machines" {
   description = "Machine-key → owner tailscale_email for machines OUTSIDE this root that must keep tailnet access (this root is the sole ACL writer and renders their tags/rules; it manages no instances or keys for them). Retiring one = delete its entry here and decommission the machine wherever it is managed."
   type        = map(string)
   default     = {}
   validation {
     condition = alltrue([
-      for k, e in var.frozen_aws_machines :
+      for k, e in var.external_machines :
       can(regex("^[a-z][a-z0-9-]*$", k)) && can(regex("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$", e))
     ])
-    error_message = "frozen_aws_machines keys must be tag-safe (^[a-z][a-z0-9-]*$) and values must be email addresses."
+    error_message = "external_machines keys must be tag-safe (^[a-z][a-z0-9-]*$) and values must be email addresses."
   }
   # Collision with flattened GCP keys would mean one tag with two owners.
   validation {
     condition = length(setintersection(
-      toset(keys(var.frozen_aws_machines)),
+      toset(keys(var.external_machines)),
       toset(flatten([
         for uname, u in var.devs : [
           for mname in keys(u.machines) : mname == "primary" ? uname : "${uname}-${mname}"
         ]
       ]))
     )) == 0
-    error_message = "frozen_aws_machines keys must not collide with flattened devs machine keys — a collision would render one tag:devbox-<key> for two different machines."
+    error_message = "external_machines keys must not collide with flattened devs machine keys — a collision would render one tag:devbox-<key> for two different machines."
   }
 }
 

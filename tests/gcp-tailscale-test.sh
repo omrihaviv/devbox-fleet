@@ -17,7 +17,7 @@ assert_contains() { rg -q --fixed-strings "$2" "$1" || fail "expected $1 to cont
 assert_contains "$ACL" 'count = var.manage_tailscale_acl ? 1 : 0'
 assert_contains "$ACL" 'overwrite_existing_content = true'
 
-# ACL constructs render over the UNION (GCP machines + var.frozen_aws_machines).
+# ACL constructs render over the UNION (GCP machines + var.external_machines).
 assert_contains "$ACL" 'local.acl_machines'
 
 # Required ACL constructs (see the Structure note in tailscale-acl.tf).
