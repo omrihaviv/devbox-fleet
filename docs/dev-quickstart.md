@@ -107,20 +107,20 @@ sudo systemctl status paseo
 sudo systemctl restart paseo
 ```
 
-Add the daemon as a direct connection in Paseo using `http://<machine>.<tailnet>.ts.net:6767` or the address printed by `tailscale ip -4` with port `6767`. The daemon listens only on the box's Tailscale IPv4 address; Paseo's hosted relay is disabled. There is no separate Paseo password for now, so the existing tailnet policy—your Tailscale identity can reach your machine, and devbox admins can reach every machine—is the access boundary.
+Add the daemon as a direct connection in Paseo using `http://<machine>.<tailnet>.ts.net:6767` — print the box's exact DNS name with `tailscale status --json | jq -r '.Self.DNSName'` — or use the address from `tailscale ip -4` with port `6767`. The daemon listens only on the box's Tailscale IPv4 address; Paseo's hosted relay is disabled. There is no separate Paseo password for now, so the existing tailnet policy—your Tailscale identity can reach your machine, and devbox admins can reach every machine—is the access boundary.
 
 The service restarts Paseo if it exits and brings it back after every
 reboot, so do not use `paseo daemon stop` for a lasting stop—systemd
 intentionally starts it again.
 
-### Agent notifications (cmux)
+### Agent notifications
 
-Onboarding wires Claude Code (`Stop` + `Notification` hooks) and Codex (`notify`) to `~/bin/tmux-osc-notify.sh`, which broadcasts an OSC 777 escape to every terminal attached to your **current tmux session**. Codex subagent completions are filtered out, so only the completed user-facing turn notifies. If that terminal is cmux on your Mac, you get a desktop notification when an agent finishes a turn or asks for input; other clients (e.g. Termius) silently ignore the bytes. Notes:
+Onboarding wires Claude Code (`Stop` + `Notification` hooks) and Codex (`notify`) to `~/bin/tmux-osc-notify.sh`, which broadcasts an OSC 777 escape to every terminal attached to your **current tmux session**. Codex subagent completions are filtered out, so only the completed user-facing turn notifies. If your terminal supports OSC 777 desktop notifications (Ghostty, WezTerm, cmux, …), you get one when an agent finishes a turn or asks for input; terminals that don't (e.g. Termius) silently ignore the bytes. Notes:
 
 - Only fires inside tmux, and only to clients attached at that moment — run agents in a tmux session (pairs well with `~/.auto-tmux`).
-- cmux suppresses the banner while its window + that workspace are focused; check the sidebar badge or notification panel.
-- Want a phone push when no Mac is attached? Uncomment the `ntfy` line at the bottom of `~/bin/tmux-osc-notify.sh` (read its privacy note first). Your edits to that file survive onboarding re-runs.
-- Notification bodies include the agent's last message, which lands in macOS Notification Center history via cmux; swap the `jq` body extraction in the hook commands for a static string if you'd rather not.
+- Most terminals suppress the banner while their window is focused; check your notification history if you expected one.
+- Want a phone push? Uncomment the `ntfy` line at the bottom of `~/bin/tmux-osc-notify.sh` (read its privacy note first). Your edits to that file survive onboarding re-runs.
+- Notification bodies include the agent's last message, which lands in your desktop notification history; swap the `jq` body extraction in the hook commands for a static string if you'd rather not.
 
 ### Sharing a dev server publicly (Tailscale Funnel)
 
