@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Run static suite
+        run: |
+          set -euo pipefail
+          for t in tests/*.sh; do
+            echo "== $t"
+            bash "$t"
+          done
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+      - name: gcp fmt/validate/test
+        run: |
+          set -euo pipefail
+          terraform -chdir=gcp fmt -check -recursive
+          terraform -chdir=gcp init -backend=false -lockfile=readonly
+          terraform -chdir=gcp validate
+          terraform -chdir=gcp test
+      - name: aws-federation fmt/validate
+        run: |
+          set -euo pipefail
+          terraform -chdir=aws-federation fmt -check -recursive
+          terraform -chdir=aws-federation init -backend=false -lockfile=readonly
+          terraform -chdir=aws-federation validate

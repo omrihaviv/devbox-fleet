@@ -5,7 +5,7 @@
 # the previously promoted config.
 #
 # Flow: terraform apply → sync-converge.sh <canary> --manifest-sha <sha>
-#       → verify → promote-runtime.sh <sha> → timers converge fleet ≤8h.
+#       → verify → promote-runtime.sh <sha> → timers converge fleet within ~9h.
 set -euo pipefail
 
 BUCKET="${DEVBOX_RUNTIME_BUCKET:-}"
@@ -31,4 +31,4 @@ fi
 
 gcloud storage cp "$candidate" "$pointer"
 echo "promoted $sha → $pointer"
-echo "fleet timers converge within ≤8h; force a box now with: scripts/gcp/sync-converge.sh <machine>"
+echo "fleet timers converge within ~9h; force a box now with: scripts/gcp/sync-converge.sh <machine>"

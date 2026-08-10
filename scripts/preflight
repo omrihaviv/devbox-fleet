@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# preflight — read-only admin-environment doctor for devbox-fleet.
+# Validates the LOCAL environment and config files only: no live
+# Tailscale/OAuth validation, no mutations of any kind. A passing run means
+# "ready to attempt the first apply", not "end-to-end verified".
+set -euo pipefail
+
+ROOT_DIR="${DEVBOX_PREFLIGHT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+BACKEND_FILE="$ROOT_DIR/gcp/backend.hcl"
+TFVARS_FILE="$ROOT_DIR/gcp/terraform.tfvars"
+REPOS_FILE="$ROOT_DIR/scripts/devbox-repos.default"
+
+TERRAFORM_MIN="1.9.0"   # matches the roots' required_version
+GCLOUD_MIN="400.0.0"
+JQ_MIN="1.6"
+GIT_MIN="2.20"
+REQUIRED_APIS="compute iam iap storage monitoring logging cloudresourcemanager"
+# The defaultless variables in gcp/variables.tf — every one needs an
+# assignment in terraform.tfvars or the first apply fails on missing inputs.
+REQUIRED_TFVARS="devbox_admins_group gcp_project_id ops_agent_version tailscale_admin_emails tailscale_oauth_client_id tailscale_oauth_client_secret tailscale_tailnet toolchain ubuntu_2404_image"
+PLACEHOLDER_RE='REPLACE|your-project-id|your-tfstate-bucket|example\.com'
+SCOPE="Local environment and config checks only — no live Tailscale/OAuth validation. ok=true means ready to attempt the first apply, not end-to-end verified."
+
+MODE=human
+case "${1:-}" in
+  --json) MODE=json ;;
+  --support) MODE=support ;;
+  "") ;;
+  *) echo "usage: preflight [--json|--support]" >&2; exit 2 ;;
+esac
+
+ids=(); statuses=(); details=(); fixes=()
+record() { # id status detail fix   (fix strings MUST be literal constants)
+  ids+=("$1"); statuses+=("$2"); details+=("$3"); fixes+=("$4")
+}
+
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+
+# --- CLI presence + version floors -------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+ver_cmd() { # tool → raw version-command output; exit status = the tool's
+  case "$1" in
+    terraform) terraform version ;;
+    gcloud)    gcloud version ;;
+    jq)        jq --version ;;
+    git)       git --version ;;
+  esac
+}
+
+ver_parse() { # tool ← raw output on stdin → parsed version (may be empty)
+  case "$1" in
+    terraform) sed -n 's/^Terraform v\([0-9][0-9.]*\).*/\1/p' ;;
+    gcloud)    sed -n 's/^Google Cloud SDK \([0-9][0-9.]*\).*/\1/p' ;;
+    jq)        sed -n 's/^jq-\([0-9][0-9.]*\).*/\1/p' ;;
+    git)       sed -n 's/^git version \([0-9][0-9.]*\).*/\1/p' ;;
+  esac | head -1
+}
+
+check_cli() { # name floor unreadable_status fix
+  local c="$1" floor="$2" unreadable="$3" f="$4" raw rc v
+  if ! have "$c"; then
+    record "cli-$c" FAIL "$c not on PATH" "$f"
+    return 0
+  fi
+  raw="$(ver_cmd "$c" 2>/dev/null)" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Present but broken: the binary cannot even report its version.
+    record "cli-$c" FAIL "$c is on PATH but running its version command failed" "$f"
+    return 0
+  fi
+  v="$(printf '%s\n' "$raw" | ver_parse "$c" || true)"
+  if [ -z "$v" ]; then
+    record "cli-$c" "$unreadable" \
+      "$c runs but its version output was not recognized (floor $floor unchecked)" "$f"
+  elif version_ge "$v" "$floor"; then
+    record "cli-$c" PASS "$c $v (floor $floor)" ""
+  else
+    record "cli-$c" FAIL "$c $v below floor $floor" "$f"
+  fi
+}
+
+# A broken binary (version command exits nonzero) is FAIL for every tool.
+# When the tool RUNS but prints an unrecognized version format, terraform
+# still FAILs (its >= 1.9.0 floor is load-bearing); gcloud/jq/git WARN —
+# presence and runnability are what matter there, the floor is a sanity
+# bound, and a false FAIL on vendor format drift would block adopters.
+check_cli terraform "$TERRAFORM_MIN" FAIL \
+  "Install Terraform >= 1.9.0: https://developer.hashicorp.com/terraform/install"
+check_cli gcloud "$GCLOUD_MIN" WARN \
+  "Install/update the Google Cloud CLI: https://cloud.google.com/sdk/docs/install"
+check_cli jq "$JQ_MIN" WARN \
+  "Install jq >= 1.6 (apt-get install jq / brew install jq)"
+check_cli git "$GIT_MIN" WARN \
+  "Install git >= 2.20"
+
+# --- gcloud ADC -------------------------------------------------------------
+if have gcloud; then
+  if gcloud auth application-default print-access-token >/dev/null 2>&1; then
+    record gcloud-adc PASS "application-default credentials work" ""
+  else
+    record gcloud-adc FAIL "no working application-default credentials" \
+      "Run: gcloud auth application-default login"
+  fi
+else
+  record gcloud-adc SKIP "gcloud missing" "Install gcloud first"
+fi
+
+# --- Config files -----------------------------------------------------------
+# Extract the fields the later checks need FIRST, so a file that merely
+# lacks its required field (no placeholder to catch) is a FAIL here rather
+# than a SKIP-masked false "ok" downstream.
+bucket=""
+[ -f "$BACKEND_FILE" ] && \
+  bucket="$(sed -n 's/^[[:space:]]*bucket[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$BACKEND_FILE" | head -1)"
+project=""
+[ -f "$TFVARS_FILE" ] && \
+  project="$(sed -n 's/^[[:space:]]*gcp_project_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$TFVARS_FILE" | head -1)"
+
+check_config() { # id file label required_value required_field_desc fix_for_missing_field
+  local id="$1" file="$2" label="$3" reqval="$4" reqdesc="$5" fixfield="$6"
+  if [ ! -f "$file" ]; then
+    record "$id" FAIL "$label missing" \
+      "Copy the matching .example file and fill in your org values"
+  elif grep -Ev '^[[:space:]]*#' "$file" | grep -Eq "$PLACEHOLDER_RE"; then
+    record "$id" FAIL "$label still contains placeholder values" \
+      "Replace every REPLACE / your-project-id / your-tfstate-bucket / example.com value"
+  elif [ -z "$reqval" ]; then
+    record "$id" FAIL "$label present but $reqdesc is not set" "$fixfield"
+  else
+    record "$id" PASS "$label present, required field set, no placeholders" ""
+  fi
+}
+check_config config-backend "$BACKEND_FILE" "gcp/backend.hcl" "$bucket" \
+  "the bucket field" 'Set bucket = "<your tfstate bucket>" in gcp/backend.hcl'
+
+# tfvars gets a fuller audit: beyond placeholders, every defaultless variable
+# in gcp/variables.tf needs an assignment (grep-level presence, not an HCL
+# parse), and gcp_project_id must be non-empty.
+if [ ! -f "$TFVARS_FILE" ]; then
+  record config-tfvars FAIL "gcp/terraform.tfvars missing" \
+    "Copy gcp/terraform.tfvars.example and fill in your org values"
+elif grep -Ev '^[[:space:]]*#' "$TFVARS_FILE" | grep -Eq "$PLACEHOLDER_RE"; then
+  record config-tfvars FAIL "gcp/terraform.tfvars still contains placeholder values" \
+    "Replace every REPLACE / your-project-id / your-tfstate-bucket / example.com value"
+else
+  missing=""
+  for v in $REQUIRED_TFVARS; do
+    grep -Eq "^[[:space:]]*${v}[[:space:]]*=" "$TFVARS_FILE" || missing="$missing $v"
+  done
+  if [ -n "$missing" ]; then
+    record config-tfvars FAIL \
+      "gcp/terraform.tfvars present but required assignment(s) missing:$missing" \
+      "Assign every variable that has no default in gcp/variables.tf — start from gcp/terraform.tfvars.example"
+  elif [ -z "$project" ]; then
+    record config-tfvars FAIL "gcp/terraform.tfvars present but gcp_project_id is empty" \
+      'Set gcp_project_id = "<your project id>" in gcp/terraform.tfvars'
+  else
+    record config-tfvars PASS \
+      "gcp/terraform.tfvars present, required assignments set, no placeholders" ""
+  fi
+fi
+
+# --- Bucket reachability ----------------------------------------------------
+if [ -z "$bucket" ] || ! have gcloud || \
+   ! gcloud auth application-default print-access-token >/dev/null 2>&1; then
+  record bucket-reachable SKIP "needs backend.hcl + gcloud + ADC" \
+    "Fix the earlier checks first"
+elif gcloud storage buckets describe "gs://$bucket" >/dev/null 2>&1; then
+  record bucket-reachable PASS "tfstate bucket gs://$bucket reachable" ""
+else
+  record bucket-reachable FAIL "cannot describe the configured tfstate bucket" \
+    "Create the versioned bucket (see docs/admin-quickstart.md) or check permissions"
+fi
+
+# --- Required APIs ----------------------------------------------------------
+if [ -z "$project" ] || ! have gcloud || \
+   ! gcloud auth application-default print-access-token >/dev/null 2>&1; then
+  record apis-enabled SKIP "needs terraform.tfvars + gcloud + ADC" \
+    "Fix the earlier checks first"
+else
+  enabled="$(gcloud services list --enabled --project "$project" \
+    --format='value(config.name)' 2>/dev/null || true)"
+  missing=""
+  for api in $REQUIRED_APIS; do
+    printf '%s\n' "$enabled" | grep -q "^${api}\.googleapis\.com$" || missing="$missing $api"
+  done
+  if [ -z "$enabled" ]; then
+    record apis-enabled FAIL "could not list services for the configured project" \
+      "Check the project id and your permissions, then re-run"
+  elif [ -n "$missing" ]; then
+    record apis-enabled FAIL "APIs not enabled:$missing" \
+      "Run the gcloud services enable command from docs/admin-quickstart.md"
+  else
+    record apis-enabled PASS "all required APIs enabled" ""
+  fi
+fi
+
+# --- Repo list (optional but first-apply-sensitive) --------------------------
+if [ -f "$REPOS_FILE" ]; then
+  record repos-default PASS "scripts/devbox-repos.default present" ""
+else
+  record repos-default WARN "scripts/devbox-repos.default missing" \
+    "Optional, but write it BEFORE the first apply — devs who onboard without it get an empty repo list that is never re-seeded (see docs/admin-runbook.md)"
+fi
+
+# --- Tailscale tfvars fields (no live API call) ------------------------------
+if [ ! -f "$TFVARS_FILE" ]; then
+  record tailscale-config SKIP "gcp/terraform.tfvars missing" \
+    "Create terraform.tfvars first"
+else
+  ts_bad=0
+  for field in tailscale_oauth_client_id tailscale_oauth_client_secret tailscale_tailnet; do
+    val="$(sed -n "s/^[[:space:]]*${field}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$TFVARS_FILE" | head -1)"
+    if [ -z "$val" ] || printf '%s' "$val" | grep -Eq "$PLACEHOLDER_RE"; then ts_bad=1; fi
+  done
+  if [ "$ts_bad" = 0 ]; then
+    record tailscale-config PASS "tailscale fields set (not validated against the Tailscale API)" ""
+  else
+    record tailscale-config FAIL "tailscale_* fields missing or placeholders" \
+      "Create the OAuth client (docs/admin-runbook.md, One-time Tailscale setup) and fill the three tailscale_* fields yourself — do not paste the secret anywhere else"
+  fi
+fi
+
+# --- Output -----------------------------------------------------------------
+ok=true
+for s in "${statuses[@]}"; do [ "$s" = FAIL ] && ok=false; done
+
+case "$MODE" in
+  json)
+    # jq must not just exist — it must run (a broken jq would otherwise kill
+    # the script below with no output at all).
+    if ! have jq || ! jq -n '{}' >/dev/null 2>&1; then
+      printf '{"scope":"%s","checks":[{"id":"cli-jq","status":"FAIL","detail":"jq required for --json but missing or not runnable","fix":"Install jq >= 1.6"}],"ok":false}\n' "$SCOPE"
+      exit 1
+    fi
+    json='[]'
+    for i in "${!ids[@]}"; do
+      json="$(printf '%s' "$json" | jq \
+        --arg id "${ids[$i]}" --arg st "${statuses[$i]}" \
+        --arg de "${details[$i]}" --arg fx "${fixes[$i]}" \
+        '. + [{id:$id,status:$st,detail:$de,fix:$fx}]')"
+    done
+    jq -n --arg scope "$SCOPE" --argjson checks "$json" --argjson ok "$ok" \
+      '{scope:$scope,checks:$checks,ok:$ok}'
+    ;;
+  support)
+    echo "devbox-fleet preflight (redacted --support output)"
+    echo "scope: $SCOPE"
+    for i in "${!ids[@]}"; do
+      printf '%-4s %s\n' "${statuses[$i]}" "${ids[$i]}"
+      [ "${statuses[$i]}" != PASS ] && [ -n "${fixes[$i]}" ] && printf '     fix: %s\n' "${fixes[$i]}"
+    done
+    ;;
+  human)
+    echo "devbox-fleet preflight"
+    echo "scope: $SCOPE"
+    echo
+    for i in "${!ids[@]}"; do
+      printf '%-4s %-18s %s\n' "${statuses[$i]}" "${ids[$i]}" "${details[$i]}"
+      [ "${statuses[$i]}" != PASS ] && [ -n "${fixes[$i]}" ] && printf '     fix: %s\n' "${fixes[$i]}"
+    done
+    echo
+    ;;
+esac
+
+$ok && exit 0 || exit 1

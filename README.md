@@ -1,78 +1,112 @@
 # devbox-fleet
 
-Per-developer cloud devboxes on GCP — one or more machines per person,
-normally reached via Tailscale SSH, with IAP as admin breakglass. No public
-application/TCP ingress, persistent per-dev data disks, automated onboarding,
-and a converged runtime keep the fleet consistent without rebuilds.
+**Always-on cloud devboxes for your team — preinstalled AI coding agents,
+reachable from anywhere via Tailscale, no public application ports.**
 
-## What you get
+[![ci](https://github.com/omrihaviv/devbox-fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/omrihaviv/devbox-fleet/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-- **Terraform root (`gcp/`)** — instances, per-dev persistent data disks,
-  daily snapshots, a VPC with no public application ingress (Tailscale
-  WireGuard UDP 41641 + IAP breakglass only), Cloud Monitoring alerts, and the
-  tailnet ACL — rendered per dev: each dev reaches only their own machines, as
-  user `dev` (admins
-  reach every box; all tailnet members reach preview ports 3000/3005 — see the
-  security baseline in `docs/admin-runbook.md`).
-- **Runtime convergence** — toolchain, memory guardrails (earlyoom), and
-  optional Bedrock config ride a content-addressed manifest in GCS.
-  `terraform apply` only uploads candidates; boxes move when you run
-  `scripts/gcp/promote-runtime.sh` after a canary. Rollback = promote the
-  previous manifest. Values explicitly set to `latest` are the documented
-  exception: they resolve a signed apt-repository candidate on each converge
-  and are **not promotion-gated**. Mirror and pin those packages if you require
-  byte-for-byte reproducibility.
-- **Dev onboarding** — first SSH login walks each dev through GitHub auth,
-  Claude Code auth, Chrome DevTools MCP, org-configured Codex MCP
-  connectors, and cloning your org's repo list.
-- **Optional AWS Bedrock access (`aws-federation/`)** — the boxes' GCP
-  service account federates into one AWS role via workload identity; no AWS
-  keys on any box.
+One `terraform apply` per developer creates a persistent Ubuntu box they can
+reach from a laptop, iPad, or phone — batteries included, safe to rebuild,
+centrally updated.
 
-## Quick start (admin)
+```mermaid
+flowchart LR
+    dev["Laptop / phone<br/>(Tailscale)"]
+    admin["Admin breakglass<br/>(Google IAP)"]
+    subgraph gcp["GCP project"]
+        subgraph vpc["VPC — inbound only WireGuard UDP 41641 + IAP-ranged SSH"]
+            a["alice-devbox"]
+            b["bob-devbox"]
+        end
+        gcs[("runtime manifest<br/>GCS")]
+    end
+    aws["AWS Bedrock<br/>(optional, keyless federation)"]
+    dev -->|Tailscale SSH / mosh| a
+    admin -.-> a
+    a -->|converge timer| gcs
+    b -->|converge timer| gcs
+    a -.-> aws
+```
 
-1. One-time Tailscale tag/OAuth setup and GCP bootstrap:
-   `docs/admin-runbook.md`.
-2. Configure:
-   ```bash
-   cd gcp
-   cp backend.hcl.example backend.hcl            # your tfstate bucket
-   cp terraform.tfvars.example terraform.tfvars  # your org values
-   cp ../scripts/devbox-repos.example ../scripts/devbox-repos.default  # optional
-   terraform init -backend-config=backend.hcl
-   ```
-   The repo list is optional, but write it **before the first apply**: it is
-   baked into each box's boot config, and a dev's `~/.devbox-repos` is seeded
-   from it once, at their first login. A dev who onboards before the list
-   exists gets an empty one that is never re-seeded.
-3. First apply with the ACL gate **closed** (`manage_tailscale_acl = false`,
-   `devs = {}`). Promote the initial runtime before any box exists, then inspect
-   the gate-closed ACL skeleton:
-   ```bash
-   terraform apply
-   DEVBOX_RUNTIME_BUCKET=$(terraform output -raw runtime_bucket) \
-     ../scripts/gcp/promote-runtime.sh $(terraform output -raw runtime_manifest_sha256)
-   terraform output -raw devbox_acl_json
-   ```
-   > **Warning:** once you flip `manage_tailscale_acl = true`, this root
-   > becomes the **sole writer** of your tailnet ACL and replaces the whole
-   > policy document on every apply. It is designed for a tailnet dedicated
-   > to devboxes — merge any other policy you need into
-   > `gcp/tailscale-acl.tf` first.
-4. Flip the gate and add your first machine together. Follow the runbook to
-   inspect the **planned** final ACL, apply that exact saved plan, and walk the
-   first-machine canary checklist.
+## Why devbox-fleet
 
-Devs: see `docs/dev-quickstart.md`.
+- **Fully managed** — devs are entries in a tfvars map; one apply adds a
+  box, its disks, snapshots, monitoring, and Tailscale access.
+- **Agent-ready out of the box** — Claude Code, Codex CLI, and two Chrome
+  DevTools MCP servers preinstalled and wired up at first login.
+- **Reachable from anywhere, exposed to almost nothing** — Tailscale SSH
+  from laptop or phone; no public application ports or SSH by default.
+- **Rebuilds are boring** — home, Docker images, and the box's Tailscale
+  identity live on a persistent disk that survives instance replacement.
+- **Safe periodic updates** — changes roll out canary → promote and reach
+  the fleet within ~9 hours; rolling back means promoting the previous
+  manifest. Packages configured as `latest` (gh, Chrome, VS Code) follow
+  their vendor repos and are **not promotion-gated**.
+- **Optional Amazon Bedrock** — boxes federate their GCP identity into one
+  AWS role; no AWS keys on any box.
 
-## Tests
+## What's on every box
 
-`bash tests/<name>.sh` — static suite, no cloud access needed. It targets a
-GNU/Linux environment with Bash, Git, GNU core utilities, `rg`, `jq`, and
-Python 3.11+ (`tomllib`). For the Terraform checks without a backend:
-`terraform init -backend=false` then `terraform validate` / `terraform test`
-in `gcp/`.
+Claude Code · Codex CLI · Chrome + DevTools MCP (ephemeral & steerable) ·
+Docker + Compose · Node (NVM) · gh · AWS CLI · VS Code for the web · tmux +
+resurrect/continuum · mosh · Paseo · earlyoom memory guardrails
+
+## Get started
+
+**Admins** (you're setting up the fleet):
+[admin quickstart](docs/admin-quickstart.md) — or let an AI coding agent
+walk you through it ([how that works](docs/setup-agent.md)): from a clone
+of this repo, paste this into any agent:
+
+```text
+Read AGENTS.md, then follow the playbook in docs/setup-agent.md to set up
+devbox-fleet for my organization. Interview me for the values you need, show
+me every cloud change and get my OK before applying it, and never ask me to
+paste secrets into chat.
+```
+
+**Developers** (you just got a box):
+[dev quickstart](docs/dev-quickstart.md).
+
+## How it works
+
+Terraform (`gcp/`) provisions the fleet. Each box re-applies a centrally
+promoted runtime configuration on a timer, so toolchain changes never need
+rebuilds: `terraform apply` uploads a candidate, you verify it on one canary
+box, and `promote-runtime.sh` releases it to everyone. Developer onboarding
+runs at first SSH login — GitHub auth, Claude Code auth, MCP servers, and
+cloning your org's repo list.
+
+## Security model
+
+- SSH only over Tailscale; port 22 is open only to Google's IAP range for
+  audited admin breakglass. Each box exposes one public port: UDP 41641 for
+  WireGuard itself.
+- **Heads up:** once enabled, this repo becomes the **sole writer of your
+  tailnet's ACL** and replaces the whole policy on every apply — use a
+  dedicated tailnet, or merge your policy first
+  ([details](docs/admin-runbook.md)).
+- Admins can reach every box on every port (incident response — and
+  tightenable). Devs can deliberately share a port publicly via Tailscale
+  Funnel.
+- No long-lived AWS or admin cloud keys on boxes; developer tokens and
+  browser sessions live on the dev's own persistent disk. Full baseline:
+  [admin runbook](docs/admin-runbook.md).
+
+## Docs
+
+[Admin quickstart](docs/admin-quickstart.md) ·
+[Admin runbook](docs/admin-runbook.md) (authoritative) ·
+[Dev quickstart](docs/dev-quickstart.md) ·
+[Agent setup](docs/setup-agent.md) · [FAQ](docs/faq.md)
+
+## Development
+
+`bash tests/<name>.sh` — static suite, no cloud needed (Bash, Git, GNU
+coreutils, `rg`, `jq`, Python 3.11+). CI runs it plus
+`terraform fmt/validate/test`. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT — see `LICENSE`.
+MIT — see [LICENSE](LICENSE).

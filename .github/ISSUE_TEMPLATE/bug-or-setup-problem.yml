@@ -1,0 +1,19 @@
+name: Bug / setup problem
+description: Something is broken or setup is failing
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: preflight
+    attributes:
+      label: Output of `scripts/preflight --support`
+      description: This mode is redacted (check ids + statuses only) and safe to paste publicly. Do NOT paste plain `scripts/preflight` output — it can contain your project id, bucket, and tailnet.
+      render: text
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else (redact org values)

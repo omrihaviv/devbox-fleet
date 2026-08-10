@@ -4,6 +4,16 @@ Everything an admin does with the fleet: one-time Tailscale and GCP bootstrap,
 the first apply (including the tailnet-ACL ownership gate), routine
 operations, offboarding, breakglass, and the quarterly restore drill.
 
+First time? Start with the condensed [admin quickstart](admin-quickstart.md);
+this runbook is the complete reference and the authority when they differ.
+
+**Converge:** each box re-applies the promoted runtime config on its own timer
+— roughly every 8 hours, plus up to 1 hour of jitter, so a change reaches the
+whole fleet within ~9 hours. **Promote:** moving the fleet-wide pointer to a
+new runtime manifest — only `scripts/gcp/promote-runtime.sh` does this;
+`terraform apply` just uploads candidates, so a converge timer that fires
+mid-canary keeps consuming the last promoted config.
+
 The Terraform root (`gcp/`) provisions every machine and is the **sole owner of
 the tailnet ACL** — the document it renders covers the machines in `var.devs`
 plus anything listed in `var.external_machines` (machines managed outside
@@ -11,15 +21,26 @@ this root that must keep tailnet access; empty for a fresh fleet). Devs reach
 their boxes as `ssh dev@<key>-devbox`.
 
 Terraform state lives in the versioned GCS bucket named in `gcp/backend.hcl`;
-Terraform authenticates with admin ADC. `terraform apply` NEVER writes the
-runtime pointer — only `scripts/gcp/promote-runtime.sh` does — so a converge
-timer that fires mid-canary keeps consuming the last promoted config.
+Terraform authenticates with admin ADC (Application Default Credentials).
+
+**Contents**
+
+- [One-time Tailscale setup](#one-time-tailscale-setup)
+- [One-time GCP bootstrap](#one-time-gcp-bootstrap)
+- [First apply](#first-apply)
+- [Routine operations](#routine-operations)
+- [Day-2 changes to `devbox-onboard` (no rebuild)](#day-2-changes-to-devbox-onboard-no-rebuild)
+- [Admin SSH and the dev's tmux](#admin-ssh-and-the-devs-tmux)
+- [Steerable Chrome health](#steerable-chrome-health)
+- [Offboarding (integrity-first)](#offboarding-integrity-first)
+- [Breakglass (reserved for when Tailscale is down)](#breakglass-reserved-for-when-tailscale-is-down)
+- [Quarterly restore drill](#quarterly-restore-drill)
 
 ## One-time Tailscale setup
 
 1. **Tailnet.** Create a tailnet at https://login.tailscale.com/, invite your
-   admin email, accept the invite. The Personal plan supports up to six free
-   users; choose a current paid plan such as Standard if the fleet outgrows it.
+   admin email, accept the invite. The free Personal plan covers up to six
+   users.
 
    **IMPORTANT — ACL ownership.** This root owns the *entire* tailnet ACL
    document via `tailscale_acl.devbox` with `overwrite_existing_content = true`.
@@ -56,9 +77,11 @@ timer that fires mid-canary keeps consuming the last promoted config.
      `tailscale_tailnet_key.devbox`
    - `policy_file` (write) — for `tailscale_acl.devbox`
 
-   Save the client id and secret into `gcp/terraform.tfvars` as
-   `tailscale_oauth_client_id` / `tailscale_oauth_client_secret`, and your
-   tailnet name as `tailscale_tailnet`.
+   Keep the client id and secret in your admin credential store for now —
+   `gcp/terraform.tfvars` does not exist yet, and the "First apply" step's
+   `cp` from the example would overwrite anything saved there earlier. You
+   fill `tailscale_oauth_client_id` / `tailscale_oauth_client_secret` and
+   your tailnet name (`tailscale_tailnet`) right after that `cp`.
 
    **Why a single tag, not `tag:devbox-*`.** Tailscale OAuth clients do NOT
    support tag wildcards — `tag:devbox-*` is not a valid scope. Authorization
@@ -83,7 +106,15 @@ done here by hand — deliberately NOT in Terraform (see the comment in
 `gcp/iam.tf`): the root grants explicit breakglass roles, but the
 `roles/owner` bootstrap must not be self-managed.
 
+gcloud keeps two separate credentials: the CLI's own login (used by every
+`gcloud` command below) and Application Default Credentials (ADC — used by
+Terraform; the block's last line). A fresh machine needs both, and the CLI
+login must come first or the mutating commands below fail with "no active
+account".
+
 ```bash
+gcloud auth list    # CLI credential — skip the next line if your admin account is already active
+gcloud auth login
 gcloud projects create your-project-id --organization=<ORG_ID>
 gcloud billing projects link your-project-id --billing-account=<BILLING_ACCOUNT>
 gcloud services enable compute.googleapis.com iam.googleapis.com iap.googleapis.com \
@@ -187,6 +218,13 @@ terraform -chdir=gcp show -json "$first_plan" \
   | jq -er '.planned_values.outputs.devbox_acl_json.value | select(type == "string" and length > 0)' \
   | jq -e .
 # STOP if this is not the complete policy you intend to own.
+```
+
+Applying a saved plan does not prompt for confirmation. Stop here and read
+the printed document; run the apply only when it is exactly the policy you
+intend to own:
+
+```bash
 terraform -chdir=gcp apply "$first_plan"
 rm -f -- "$first_plan" && rmdir -- "$first_plan_dir"
 ```
@@ -256,7 +294,7 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
   scripts/gcp/sync-converge.sh <canary-machine> --manifest-sha "$SHA"   # force this box onto the candidate now
   # verify the canary, then:
   DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
-    scripts/gcp/promote-runtime.sh "$SHA"                               # fleet converges ≤8h
+    scripts/gcp/promote-runtime.sh "$SHA"                               # fleet converges within ~9h
   ```
 - **Resize `machine_type`.** Change it in tfvars, `terraform -chdir=gcp apply`. `allow_stopping_for_update = true` stops and restarts the instance in place — NOT a rebuild (no generation bump, no key rotation, data disk untouched).
 - **Grow the data disk.** Raise `data_disk_gb` in tfvars (grow-only — GCE rejects shrinks), `terraform -chdir=gcp apply`, then extend the filesystem on the box:
@@ -272,7 +310,7 @@ New devboxes install Paseo below `/home/dev/.local/share/paseo/npm`, owned by
 `dev`. The primary `/home/dev/.local/bin/paseo` launcher and its
 `/usr/local/bin/paseo` fallback export that directory as `NPM_CONFIG_PREFIX`, so
 Paseo's daemon self-updater can run its normal global npm update without sudo.
-The user launcher precedes an old NVM-global Paseo command on the normal devbox
+The user launcher precedes any NVM-global Paseo copy on the normal devbox
 PATH. Do not set a persistent npm `prefix` in `/home/dev/.npmrc`; that conflicts
 with the devbox's NVM-managed Node installation.
 
@@ -291,9 +329,8 @@ ssh dev@<key>-devbox '
 ```
 
 `paseo daemon status` is read-only. Convergence reconciles and enables
-`paseo.service` even when the Paseo installation success marker already
-exists, so the setting reaches existing devboxes without reinstalling the
-package. If a detached daemon is already running, the service leaves it alone
+`paseo.service` on every run, even when Paseo itself is already installed.
+If a detached daemon is already running, the service leaves it alone
 and waits; it takes over foreground supervision when that process exits. After
 a reboot, systemd starts Paseo directly. To finish the handoff immediately,
 run `paseo daemon stop`; the service begins managed startup on its next
@@ -376,7 +413,7 @@ This creates/attaches `admin` while leaving the dev's `main` untouched. The dev 
 
 ## Steerable Chrome health
 
-The long-lived Chrome that backs the `chrome-devtools-steered` MCP server is `chrome-steered.service` on each devbox. Chrome itself binds CDP to `127.0.0.1:9222`; the boot script publishes that port to the tailnet via `tailscale serve --bg --tcp=9222 tcp://127.0.0.1:9222`, so a dev's laptop reaches it as `<dev>-devbox:9222` with no SSH tunnel.
+The long-lived Chrome that backs the `chrome-devtools-steered` MCP server is `chrome-steered.service` on each devbox. Chrome itself binds CDP (the Chrome DevTools Protocol) to `127.0.0.1:9222`; the boot script publishes that port to the tailnet via `tailscale serve --bg --tcp=9222 tcp://127.0.0.1:9222`, so a dev's laptop reaches it as `<dev>-devbox:9222` with no SSH tunnel.
 
 Quick health probes:
 
