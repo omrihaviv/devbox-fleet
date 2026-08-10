@@ -6,6 +6,8 @@
 
 **What survives a rebuild?** — The per-dev data disk: `/home` (repos, auth tokens, agent config), Docker images/volumes, and the box's Tailscale identity. Rebuilds are routine, not disasters.
 
+**Can devs get different machine sizes?** — Yes. `machine_type`, disk sizes, and swap are per-machine settings in `devs` (fleet defaults otherwise), and a dev can have more than one machine. Changing the machine type later is an in-place stop/restart — not a rebuild — and disks can grow too; either way the dev's data persists ([runbook](admin-runbook.md#routine-operations)).
+
 **How do updates reach the boxes?** — `terraform apply` uploads a candidate; you test it on one canary box; `promote-runtime.sh` moves the fleet pointer; every box converges within ~9 hours. Rollback = promote the previous manifest. Exception: packages configured as `latest` (gh, Chrome, VS Code) track their vendor repos and are not promotion-gated.
 
 **Is my box reachable from the internet?** — No public application ports or SSH by default: SSH only over Tailscale, port 22 open only to Google's IAP range for admin breakglass, and one public UDP port (41641) for WireGuard itself. You can deliberately share a port publicly with Tailscale Funnel — that's a feature, off by default.

@@ -182,5 +182,7 @@ sequenceDiagram
 Full walkthrough: [runbook, Routine operations](admin-runbook.md#routine-operations).
 
 Add a dev later: append to `devs`, `terraform -chdir=gcp apply`, tell them
-`ssh dev@<key>-devbox`. Everything else (Bedrock federation, resizing,
-rebuilds, offboarding, breakglass): [admin runbook](admin-runbook.md).
+`ssh dev@<key>-devbox`. Machine size, disks, and swap are per-machine knobs
+in each entry, and safe to change later — resizes apply in place, and the
+dev's data disk persists regardless. Everything else (Bedrock federation,
+resizing, rebuilds, offboarding, breakglass): [admin runbook](admin-runbook.md).

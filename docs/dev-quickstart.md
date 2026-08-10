@@ -191,6 +191,8 @@ Docker Engine + Compose plugin are pre-installed. Both `/var/lib/docker` and `/v
 
 Your `/home` (work, auth tokens, git repos, Claude config), Docker images, and Tailscale identity all live on a persistent disk that survives instance rebuilds. After a rebuild, the onboarding marker `~/.devbox-onboarded` is still there, so onboarding does not re-run.
 
+The same applies to resizes: if you need more CPU, RAM, or disk, ask your admin — your box restarts once and everything on your disk stays.
+
 ## Reporting issues
 
 Tell your admin. They'll check `/var/log/devbox-startup.log` and

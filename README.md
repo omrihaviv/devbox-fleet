@@ -32,13 +32,15 @@ flowchart LR
 ## Why devbox-fleet
 
 - **Fully managed** — devs are entries in a tfvars map; one apply adds a
-  box, its disks, snapshots, monitoring, and Tailscale access.
+  box, its disks, snapshots, monitoring, and Tailscale access. Machine
+  size, disks, and swap are chosen per machine.
 - **Agent-ready out of the box** — Claude Code, Codex CLI, and two Chrome
   DevTools MCP servers preinstalled and wired up at first login.
 - **Reachable from anywhere, exposed to almost nothing** — Tailscale SSH
   from laptop or phone; no public application ports or SSH by default.
 - **Rebuilds are boring** — home, Docker images, and the box's Tailscale
-  identity live on a persistent disk that survives instance replacement.
+  identity live on a persistent disk that survives instance replacement —
+  which also makes upsizing a machine later a one-line, in-place change.
 - **Safe periodic updates** — changes roll out canary → promote and reach
   the fleet within ~9 hours; rolling back means promoting the previous
   manifest. Packages configured as `latest` (gh, Chrome, VS Code) follow

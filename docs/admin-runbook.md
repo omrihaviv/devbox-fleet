@@ -286,7 +286,7 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
 
 ## Routine operations
 
-- **Add a machine.** Append the entry to `var.devs` in `gcp/terraform.tfvars`, `terraform -chdir=gcp apply`. The Tailscale auth key mints under the gate's protection (the delegating `tag:devbox-key-minter`). Tell the dev: *"Your devbox is up — `ssh dev@<key>-devbox`."*
+- **Add a machine.** Append the entry to `var.devs` in `gcp/terraform.tfvars`, `terraform -chdir=gcp apply`. The Tailscale auth key mints under the gate's protection (the delegating `tag:devbox-key-minter`). Each machine's `machine_type`, `root_disk_gb`, `data_disk_gb`, and `swap_gib` override the fleet defaults — the bullets below cover changing them on a live box. Tell the dev: *"Your devbox is up — `ssh dev@<key>-devbox`."*
 - **Grow a root disk.** `root_disk_gb` is a creation-only default (120 GB): routine applies do not resize existing roots, while a later instance rebuild uses the then-current configured size. To grow an existing root without replacement, first take or confirm a recent snapshot, run `gcloud compute disks resize <key>-devbox --size=<gb>GB --zone=<zone>`, and verify `lsblk` plus `df -h /`. The public Ubuntu image expands the root partition and filesystem automatically. Terraform intentionally ignores post-creation root-size drift, and Persistent Disks cannot shrink.
 - **Roll out a runtime change (canary → promote).** `terraform -chdir=gcp apply` uploads the new content-addressed candidate. Canary one box, verify, then promote to the fleet:
   ```bash
