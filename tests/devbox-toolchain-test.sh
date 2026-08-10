@@ -3,6 +3,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# The dev user in fixtures must be the CURRENT user: a non-root test run can
+# only chown/sudo to itself, and CI runners have no 'dev' account.
+test_user="$(id -un)"
+
 fail() {
   echo "FAIL: $*" >&2
   exit 1
@@ -599,7 +603,7 @@ run_codex_step() {
     DEVBOX_TEST_CODEX_STATE_MOVE_FAIL="${DEVBOX_TEST_CODEX_STATE_MOVE_FAIL:-0}" \
     DEVBOX_TEST_CODEX_VERIFY_LOG="$workdir/verify.log" \
     DEVBOX_TEST_CODEX_VERIFY_FAIL="${DEVBOX_TEST_CODEX_VERIFY_FAIL:-0}" \
-    DEV_USER=dev \
+    DEV_USER="$test_user" \
     DEV_HOME="$workdir/home" \
     GCP_RUNTIME_BUCKET_FILE="$workdir/etc/devbox/runtime-bucket" \
     BOOTSTRAP_COMPLETE_FILE="$workdir/var/lib/devbox-bootstrap/complete" \
@@ -632,7 +636,7 @@ run_paseo_step() {
     DEVBOX_TEST_PASEO_VERIFY_LOG="$workdir/paseo-verify.log" \
     DEVBOX_TEST_PASEO_VERIFY_FAIL="${DEVBOX_TEST_PASEO_VERIFY_FAIL:-0}" \
     DEVBOX_TEST_DAEMON_RELOAD_FAIL="${DEVBOX_TEST_DAEMON_RELOAD_FAIL:-0}" \
-    DEV_USER=dev \
+    DEV_USER="$test_user" \
     DEV_HOME="$workdir/home" \
     GCP_RUNTIME_BUCKET_FILE="$workdir/etc/devbox/runtime-bucket" \
     BOOTSTRAP_COMPLETE_FILE="$workdir/var/lib/devbox-bootstrap/complete" \
@@ -663,7 +667,7 @@ run_agent_plugins_step() {
   DEVBOX_TEST_LOG="$workdir/commands.log" \
     DEVBOX_TEST_PLUGIN_LOG="$workdir/plugin.log" \
     DEVBOX_TEST_PLUGIN_FAIL_COMMAND="${DEVBOX_TEST_PLUGIN_FAIL_COMMAND:-}" \
-    DEV_USER=dev \
+    DEV_USER="$test_user" \
     DEV_HOME="$workdir/home" \
     GCP_RUNTIME_BUCKET_FILE="$workdir/etc/devbox/runtime-bucket" \
     BOOTSTRAP_COMPLETE_FILE="$workdir/var/lib/devbox-bootstrap/complete" \
@@ -686,7 +690,7 @@ run_tmux_plugins_step() {
     DEVBOX_TEST_GIT_FETCH_FAIL="${DEVBOX_TEST_GIT_FETCH_FAIL:-0}" \
     DEVBOX_TEST_TMUX_LOG="$workdir/tmux.log" \
     DEVBOX_TEST_TMUX_RELOAD_LOG="$workdir/tmux-reload.log" \
-    DEV_USER=dev \
+    DEV_USER="$test_user" \
     DEV_HOME="$workdir/home" \
     TMUX_PLUGINS_DIR="$workdir/opt/tmux-plugins" \
     TMUX_CONF_FILE="$workdir/home/.tmux.conf" \
@@ -732,7 +736,7 @@ run_vscode_step() {
     DEVBOX_TEST_VSCODE_APT_FAIL="${DEVBOX_TEST_VSCODE_APT_FAIL:-0}" \
     DEVBOX_TEST_VSCODE_LAUNCHER_INSTALL_FAIL="${DEVBOX_TEST_VSCODE_LAUNCHER_INSTALL_FAIL:-0}" \
     DEVBOX_TEST_VSCODE_INSTALL_LOG="$workdir/vscode-install.log" \
-    DEV_USER=dev \
+    DEV_USER="$test_user" \
     DEV_HOME="$workdir/home" \
     GCP_RUNTIME_BUCKET_FILE="$workdir/etc/devbox/runtime-bucket" \
     BOOTSTRAP_COMPLETE_FILE="$workdir/var/lib/devbox-bootstrap/complete" \
@@ -1132,7 +1136,7 @@ test_codex_new_gcp_bootstrap_and_post_success_noop() {
   grep -q "non_interactive=1 release=unset dir=$workdir/home/.local/bin home=$workdir/home" \
     "$workdir/install.log" || fail "Codex installer did not receive the expected unpinned non-interactive environment"
   if [ ! -f "$workdir/verify.log" ] \
-      || ! grep -qxF "verify -u dev -H env HOME=$workdir/home $workdir/home/.local/bin/codex --version" \
+      || ! grep -qxF "verify -u $test_user -H env HOME=$workdir/home $workdir/home/.local/bin/codex --version" \
         "$workdir/verify.log"; then
     fail "Codex command was not verified through the dev-user boundary"
   fi
@@ -1300,7 +1304,7 @@ test_codex_verification_failure_keeps_marker_and_cleans_installer() {
   [ "$(wc -l < "$workdir/install.log")" -eq 1 ] \
     || fail "Codex installer did not complete before verification failure"
   if [ ! -f "$workdir/verify.log" ] \
-      || ! grep -qxF "verify -u dev -H env HOME=$workdir/home $workdir/home/.local/bin/codex --version" \
+      || ! grep -qxF "verify -u $test_user -H env HOME=$workdir/home $workdir/home/.local/bin/codex --version" \
         "$workdir/verify.log"; then
     fail "failed Codex verification did not cross the dev-user boundary"
   fi
@@ -1404,10 +1408,10 @@ test_vscode_new_gcp_bootstrap_and_post_success_noop() {
     || fail "VS Code version was not verified"
   grep -qxF 'code serve-web --help' "$workdir/vscode.log" \
     || fail "VS Code serve-web support was not verified"
-  grep -qxF "verify -u dev -H env HOME=$workdir/home $workdir/fake-bin/code --version" \
+  grep -qxF "verify -u $test_user -H env HOME=$workdir/home $workdir/fake-bin/code --version" \
     "$workdir/vscode-verify.log" \
     || fail "VS Code version verification did not run as the dev user"
-  grep -qxF "verify -u dev -H env HOME=$workdir/home $workdir/fake-bin/code serve-web --help" \
+  grep -qxF "verify -u $test_user -H env HOME=$workdir/home $workdir/fake-bin/code serve-web --help" \
     "$workdir/vscode-verify.log" \
     || fail "VS Code serve-web verification did not run as the dev user"
   [ -x "$workdir/usr/local/bin/devbox-vscode" ] \
@@ -1585,11 +1589,11 @@ test_paseo_new_gcp_bootstrap_installs_latest_and_writes_tailnet_config() {
   grep -qxF 'npm install -g @getpaseo/cli@latest' "$workdir/commands.log" \
     || fail "new GCP bootstrap did not install Paseo from npm latest"
   grep -qxF \
-    "install -u dev -H env HOME=$workdir/home NPM_CONFIG_PREFIX=$workdir/home/.local/share/paseo/npm $workdir/fake-bin/npm install -g @getpaseo/cli@latest" \
+    "install -u $test_user -H env HOME=$workdir/home NPM_CONFIG_PREFIX=$workdir/home/.local/share/paseo/npm $workdir/fake-bin/npm install -g @getpaseo/cli@latest" \
     "$workdir/paseo-install-boundary.log" \
     || fail "Paseo npm install did not cross the dev-user prefix boundary"
   grep -qxF \
-    "verify -u dev -H env HOME=$workdir/home NPM_CONFIG_PREFIX=$workdir/home/.local/share/paseo/npm $workdir/home/.local/bin/paseo --version" \
+    "verify -u $test_user -H env HOME=$workdir/home NPM_CONFIG_PREFIX=$workdir/home/.local/share/paseo/npm $workdir/home/.local/bin/paseo --version" \
     "$workdir/paseo-verify.log" \
     || fail "Paseo command verification did not cross the dev-user boundary"
   awk -v dest="$workdir/home/.local/bin/paseo" '
@@ -1612,13 +1616,13 @@ test_paseo_new_gcp_bootstrap_installs_latest_and_writes_tailnet_config() {
     || fail "Paseo provisioning did not create the user-owned command"
   [ -d "$workdir/home/.local/share/paseo/npm/lib/node_modules/@getpaseo/cli" ] \
     || fail "Paseo provisioning did not create the user-owned package"
-  [ "$(stat -c '%U:%G' "$workdir/home/.local/share/paseo/npm")" = dev:dev ] \
+  [ "$(stat -c '%U:%G' "$workdir/home/.local/share/paseo/npm")" = "$test_user:$test_user" ] \
     || fail "Paseo npm prefix is not owned by dev"
-  [ "$(stat -c '%U:%G' "$workdir/home/.local/share/paseo/npm/bin/paseo")" = dev:dev ] \
+  [ "$(stat -c '%U:%G' "$workdir/home/.local/share/paseo/npm/bin/paseo")" = "$test_user:$test_user" ] \
     || fail "Paseo user command is not owned by dev"
-  [ "$(stat -c '%U:%G' "$workdir/home/.local/share/paseo/npm/lib/node_modules/@getpaseo/cli")" = dev:dev ] \
+  [ "$(stat -c '%U:%G' "$workdir/home/.local/share/paseo/npm/lib/node_modules/@getpaseo/cli")" = "$test_user:$test_user" ] \
     || fail "Paseo package is not owned by dev"
-  [ "$(stat -c '%U:%G' "$workdir/home/.local/bin/paseo")" = dev:dev ] \
+  [ "$(stat -c '%U:%G' "$workdir/home/.local/bin/paseo")" = "$test_user:$test_user" ] \
     || fail "Paseo user launcher is not owned by dev"
   [ ! -e "$workdir/home/.npmrc" ] \
     || fail "Paseo provisioning changed the dev user's general npm prefix"
@@ -1667,9 +1671,9 @@ test_paseo_new_gcp_bootstrap_installs_latest_and_writes_tailnet_config() {
     || fail "Paseo home directory mode is not 0700"
   [ "$(stat -c '%a' "$workdir/home/.paseo/config.json")" = 600 ] \
     || fail "Paseo config mode is not 0600"
-  [ "$(stat -c '%U:%G' "$workdir/home/.paseo")" = dev:dev ] \
+  [ "$(stat -c '%U:%G' "$workdir/home/.paseo")" = "$test_user:$test_user" ] \
     || fail "Paseo home directory is not owned by dev"
-  [ "$(stat -c '%U:%G' "$workdir/home/.paseo/config.json")" = dev:dev ] \
+  [ "$(stat -c '%U:%G' "$workdir/home/.paseo/config.json")" = "$test_user:$test_user" ] \
     || fail "Paseo config is not owned by dev"
 }
 
@@ -2139,7 +2143,7 @@ test_tmux_plugins_rewrites_drifted_block_and_reloads_running_server() {
     || fail "rewritten managed block did not land verbatim at the end"
   [ "$(grep -cF '>>> devbox-managed: tmux plugins >>>' "$workdir/home/.tmux.conf")" -eq 1 ] \
     || fail "managed block should appear exactly once after the rewrite"
-  grep -qF "reload -u dev -H $workdir/fake-bin/tmux source-file $workdir/home/.tmux.conf" \
+  grep -qF "reload -u $test_user -H $workdir/fake-bin/tmux source-file $workdir/home/.tmux.conf" \
     "$workdir/tmux-reload.log" \
     || fail "running tmux server was not reloaded through the dev-user boundary"
 }
