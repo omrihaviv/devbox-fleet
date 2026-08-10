@@ -849,9 +849,9 @@ test_matching_versions_are_noop() {
     DEVBOX_TMUX_RESURRECT_COMMIT=1111111111111111111111111111111111111111 \
     DEVBOX_TMUX_CONTINUUM_COMMIT=2222222222222222222222222222222222222222 \
     PATH="$workdir/fake-bin:$PATH" \
-    "$repo_root/scripts/devbox-toolchain" >/tmp/devbox-toolchain-test.out
+    "$repo_root/scripts/devbox-toolchain" >"$workdir/toolchain-test.out"
 
-  grep -qF "devbox-toolchain complete" /tmp/devbox-toolchain-test.out || fail "toolchain did not complete"
+  grep -qF "devbox-toolchain complete" "$workdir/toolchain-test.out" || fail "toolchain did not complete"
   if [ -f "$workdir/commands.log" ] && grep -Eq 'apt-get .* install|npm install' "$workdir/commands.log"; then
     cat "$workdir/commands.log" >&2
     fail "matching versions should not call apt-get install or npm install"
@@ -950,9 +950,9 @@ test_containerd_migration() {
     DEVBOX_TMUX_RESURRECT_COMMIT=1111111111111111111111111111111111111111 \
     DEVBOX_TMUX_CONTINUUM_COMMIT=2222222222222222222222222222222222222222 \
     PATH="$workdir/fake-bin:$PATH" \
-    "$repo_root/scripts/devbox-toolchain" >/tmp/devbox-toolchain-test.out
+    "$repo_root/scripts/devbox-toolchain" >"$workdir/toolchain-test.out"
 
-  grep -qF "devbox-toolchain complete" /tmp/devbox-toolchain-test.out || fail "toolchain did not complete during migration"
+  grep -qF "devbox-toolchain complete" "$workdir/toolchain-test.out" || fail "toolchain did not complete during migration"
   grep -q 'systemctl stop docker.socket docker.service containerd.service' "$workdir/commands.log" \
     || fail "migration should stop docker and containerd before moving the store"
   grep -q "mount --bind $workdir/data/containerd $workdir/var/lib/containerd" "$workdir/commands.log" \
@@ -1193,7 +1193,7 @@ test_codex_failure_marker_retries_after_bootstrap() {
     || fail "failed Codex install did not retain retry marker"
   [ ! -e "$workdir/var/lib/devbox-runtime/codex-cli-installed" ] \
     || fail "failed Codex install created a false success marker"
-  installer="$(awk '$1 == "chown" && $2 == "dev" { print $3; exit }' "$workdir/chown.log")"
+  installer="$(awk -v u="$test_user" '$1 == "chown" && $2 == u { print $3; exit }' "$workdir/chown.log")"
   [ -n "$installer" ] || fail "failed Codex install did not reach ownership transfer"
   [ ! -e "$installer" ] || fail "failed Codex install leaked its temporary file"
 
@@ -1228,7 +1228,7 @@ test_codex_ownership_failure_keeps_marker_and_cleans_installer() {
   [ ! -e "$workdir/install.log" ] \
     || fail "Codex installer ran after ownership transfer failed"
 
-  installer="$(awk '$1 == "chown" && $2 == "dev" { print $3 }' "$workdir/chown.log")"
+  installer="$(awk -v u="$test_user" '$1 == "chown" && $2 == u { print $3 }' "$workdir/chown.log")"
   [ -n "$installer" ] || fail "Codex installer ownership transfer was not attempted"
   [ ! -e "$installer" ] || fail "failed Codex installer ownership transfer leaked its temporary file"
 }
@@ -1309,7 +1309,7 @@ test_codex_verification_failure_keeps_marker_and_cleans_installer() {
     fail "failed Codex verification did not cross the dev-user boundary"
   fi
 
-  installer="$(awk '$1 == "chown" && $2 == "dev" { print $3; exit }' "$workdir/chown.log")"
+  installer="$(awk -v u="$test_user" '$1 == "chown" && $2 == u { print $3; exit }' "$workdir/chown.log")"
   [ -n "$installer" ] || fail "failed Codex verification did not record its temporary installer"
   [ ! -e "$installer" ] || fail "failed Codex command verification leaked its temporary installer"
 }
@@ -1596,9 +1596,9 @@ test_paseo_new_gcp_bootstrap_installs_latest_and_writes_tailnet_config() {
     "verify -u $test_user -H env HOME=$workdir/home NPM_CONFIG_PREFIX=$workdir/home/.local/share/paseo/npm $workdir/home/.local/bin/paseo --version" \
     "$workdir/paseo-verify.log" \
     || fail "Paseo command verification did not cross the dev-user boundary"
-  awk -v dest="$workdir/home/.local/bin/paseo" '
-    $1 == "install" && $2 == "-o" && $3 == "dev" &&
-      $4 == "-g" && $5 == "dev" && $6 == "-m" && $7 == "0755" &&
+  awk -v dest="$workdir/home/.local/bin/paseo" -v u="$test_user" '
+    $1 == "install" && $2 == "-o" && $3 == u &&
+      $4 == "-g" && $5 == u && $6 == "-m" && $7 == "0755" &&
       $NF == dest { found = 1 }
     END { exit !found }
   ' "$workdir/paseo-launcher-install.log" \
@@ -1716,7 +1716,7 @@ EOF
   grep -qxF "RequiresMountsFor=$workdir/home" \
     "$workdir/etc/systemd/system/paseo.service" \
     || fail "Paseo service can start before the persistent home is mounted"
-  grep -qxF 'User=dev' "$workdir/etc/systemd/system/paseo.service" \
+  grep -qxF "User=$test_user" "$workdir/etc/systemd/system/paseo.service" \
     || fail "Paseo service does not run as dev"
   grep -qxF \
     "Environment=PATH=$workdir/home/.local/bin:$workdir/home/.nvm/versions/node/v22.22.2/bin:$workdir/usr/local/bin:/usr/bin:/bin" \
