@@ -1,0 +1,805 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SWAP_SIZE_GIB="${DEVBOX_SWAP_SIZE_GIB:-16}"
+SWAPPINESS="${DEVBOX_SWAPPINESS:-60}"
+# earlyoom (process-level kills) is the primary memory responder; systemd-oomd
+# is demoted to a swap-exhaustion backstop (ManagedOOMSwap=kill on user.slice).
+# Pressure-based cgroup killing is disabled at both user@.service (Ubuntu
+# ships a 50% kill default there) and user.slice — a cgroup-level kill takes
+# out the whole tmux/SSH session instead of the single runaway process.
+OOMD_SWAP_USED_LIMIT="${DEVBOX_OOMD_SWAP_USED_LIMIT:-95%}"
+# systemd 255 exposes a configured 70% ManagedOOMMemoryPressureLimit as this
+# UINT32 fixed-point value (round(0.70 * UINT32_MAX)).
+EMERGENCY_OOMD_PRESSURE_LIMIT_NORMALIZED=3006477107
+EARLYOOM_ENABLED="${DEVBOX_EARLYOOM_ENABLED:-true}"
+EARLYOOM_MEM_PCT="${DEVBOX_EARLYOOM_MEM_PCT:-8,4}"
+EARLYOOM_SWAP_PCT="${DEVBOX_EARLYOOM_SWAP_PCT:-15,8}"
+EARLYOOM_AVOID_REGEX="${DEVBOX_EARLYOOM_AVOID_REGEX:-^(tailscaled|sshd|dockerd|containerd.*|otelopscol|google_guest_ag|google_osconfig|systemd.*|earlyoom)$}"
+DEV_USER="${DEVBOX_DEV_USER:-dev}"
+ROOT_FREE_RESERVE_GIB="${DEVBOX_ROOT_FREE_RESERVE_GIB:-12}"
+STATE_DIR="${DEVBOX_RUNTIME_STATE_DIR:-/var/lib/devbox-runtime}"
+
+SWAPFILE="${DEVBOX_SWAPFILE:-/swapfile}"
+FSTAB="${DEVBOX_FSTAB:-/etc/fstab}"
+SYSCTL_CONF="${DEVBOX_SYSCTL_CONF:-/etc/sysctl.d/99-devbox-memory.conf}"
+OOMD_CONF_DIR="${DEVBOX_OOMD_CONF_DIR:-/etc/systemd/oomd.conf.d}"
+OOMD_CONF="${DEVBOX_OOMD_CONF:-${OOMD_CONF_DIR}/50-devbox.conf}"
+LEGACY_USER_SLICE_DROPIN="${DEVBOX_LEGACY_USER_SLICE_DROPIN:-/etc/systemd/system/user.slice.d/50-devbox-oomd.conf}"
+EARLYOOM_DEFAULT="${DEVBOX_EARLYOOM_DEFAULT:-/etc/default/earlyoom}"
+USER_SERVICE_DROPIN="${DEVBOX_USER_SERVICE_DROPIN:-/etc/systemd/system/user@.service.d/50-devbox-oomd.conf}"
+SESSION_SCOPE_DROPIN="${DEVBOX_SESSION_SCOPE_DROPIN:-/etc/systemd/system/session-.scope.d/50-devbox-oomd.conf}"
+PROC_DIR="${DEVBOX_PROC_DIR:-/proc}"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "FATAL: run as root" >&2
+  exit 1
+fi
+
+install -d -m 0755 "$STATE_DIR"
+
+if [ "$SWAP_SIZE_GIB" -lt 0 ] || [ "$SWAP_SIZE_GIB" -gt 64 ]; then
+  echo "FATAL: DEVBOX_SWAP_SIZE_GIB must be between 0 and 64" >&2
+  exit 1
+fi
+
+write_marker_if_changed() {
+  local marker="$1"
+  local value="$2"
+  local desired_marker
+
+  desired_marker="$(mktemp)"
+  printf '%s\n' "$value" > "$desired_marker"
+  if [ ! -f "$marker" ] || ! cmp -s "$desired_marker" "$marker"; then
+    install -m 0644 "$desired_marker" "$marker"
+  fi
+  rm -f "$desired_marker"
+}
+
+validate_pct_pair() {
+  local name="$1" value="$2" term_pct kill_pct
+
+  if ! [[ "$value" =~ ^[0-9]+,[0-9]+$ ]]; then
+    echo "FATAL: $name must be TERM,KILL integer percentages (got: $value)" >&2
+    exit 1
+  fi
+  # Match the complete 1-100 domain before using Bash's fixed-width integer
+  # comparisons. Leading zeroes remain accepted, matching Terraform's
+  # ordinary integer-string contract, but an arbitrarily long nonzero value
+  # never reaches `test -gt`.
+  if ! [[ "$value" =~ ^0*(100|[1-9][0-9]?),0*(100|[1-9][0-9]?)$ ]]; then
+    echo "FATAL: $name percentages must be 1-100 with KILL <= TERM (got: $value)" >&2
+    exit 1
+  fi
+  term_pct="${BASH_REMATCH[1]}"
+  kill_pct="${BASH_REMATCH[2]}"
+  if [ "$kill_pct" -gt "$term_pct" ]; then
+    echo "FATAL: $name percentages must be 1-100 with KILL <= TERM (got: $value)" >&2
+    exit 1
+  fi
+}
+
+# Step-1 invariant: nothing is touched on validation failure.
+validate_earlyoom_knobs() {
+  local rc
+
+  case "$EARLYOOM_ENABLED" in
+    true|false) ;;
+    *)
+      echo "FATAL: DEVBOX_EARLYOOM_ENABLED must be true or false (got: $EARLYOOM_ENABLED)" >&2
+      exit 1
+      ;;
+  esac
+  validate_pct_pair DEVBOX_EARLYOOM_MEM_PCT "$EARLYOOM_MEM_PCT"
+  validate_pct_pair DEVBOX_EARLYOOM_SWAP_PCT "$EARLYOOM_SWAP_PCT"
+
+  if [ -z "$EARLYOOM_AVOID_REGEX" ]; then
+    echo "FATAL: DEVBOX_EARLYOOM_AVOID_REGEX must not be empty" >&2
+    exit 1
+  fi
+  case "$EARLYOOM_AVOID_REGEX" in
+    *[[:space:]]*|*\"*|*\'*)
+      # systemd expands $EARLYOOM_ARGS with NO quote removal;
+      # whitespace/quotes in the regex would corrupt the argv.
+      echo "FATAL: DEVBOX_EARLYOOM_AVOID_REGEX must not contain whitespace or quotes" >&2
+      exit 1
+      ;;
+  esac
+  rc=0
+  printf '' | grep -E -- "$EARLYOOM_AVOID_REGEX" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    echo "FATAL: DEVBOX_EARLYOOM_AVOID_REGEX does not compile as a POSIX ERE" >&2
+    exit 1
+  fi
+}
+
+validate_earlyoom_knobs
+
+if ! DEV_USER_UID="$(id -u "$DEV_USER")"; then
+  echo "FATAL: could not resolve UID for devbox user: $DEV_USER" >&2
+  exit 1
+fi
+USER_SERVICE_UNIT="user@${DEV_USER_UID}.service"
+
+sha256_text() {
+  sha256sum | awk '{print $1}'
+}
+
+root_avail_gib="$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')"
+required_gib=$((SWAP_SIZE_GIB + ROOT_FREE_RESERVE_GIB))
+
+if [ "$SWAP_SIZE_GIB" -gt 0 ] && [ ! -f "$SWAPFILE" ] && [ "$root_avail_gib" -lt "$required_gib" ]; then
+  echo "FATAL: / has only ${root_avail_gib}GiB free; need ${required_gib}GiB for ${SWAP_SIZE_GIB}GiB swap plus reserve" >&2
+  exit 1
+fi
+
+ensure_swap() {
+  local desired_bytes current_bytes resize_swap swap_used_bytes reclaimable_gib
+
+  if [ "$SWAP_SIZE_GIB" -le 0 ]; then
+    return 0
+  fi
+
+  desired_bytes=$((SWAP_SIZE_GIB * 1024 * 1024 * 1024))
+  current_bytes=0
+  if [ -f "$SWAPFILE" ]; then
+    current_bytes="$(stat -c '%s' "$SWAPFILE")"
+  fi
+  resize_swap=true
+
+  if [ "$current_bytes" -ne 0 ] && [ "$current_bytes" -ne "$desired_bytes" ]; then
+    swap_used_bytes="$(free -b | awk '/^Swap:/ {print $3}')"
+    swap_used_bytes="${swap_used_bytes:-0}"
+    # The old swapfile is deleted before the new one is allocated, so its
+    # size (floored: conservative) counts toward the free-space requirement.
+    reclaimable_gib=$((current_bytes / 1024 / 1024 / 1024))
+    if [ "$swap_used_bytes" -ne 0 ]; then
+      echo "WARN: $SWAPFILE is ${current_bytes} bytes, desired ${desired_bytes}, but swap is in use; leaving current swapfile active" >&2
+      resize_swap=false
+    elif [ $((root_avail_gib + reclaimable_gib)) -lt "$required_gib" ]; then
+      echo "WARN: / has only ${root_avail_gib}GiB free plus ${reclaimable_gib}GiB reclaimable swapfile; need ${required_gib}GiB to recreate ${SWAP_SIZE_GIB}GiB swap plus reserve; leaving current swapfile active" >&2
+      resize_swap=false
+    else
+      swapoff "$SWAPFILE" || true
+      rm -f "$SWAPFILE"
+    fi
+  fi
+
+  if [ "$resize_swap" = true ] && [ ! -f "$SWAPFILE" ]; then
+    fallocate -l "${SWAP_SIZE_GIB}G" "$SWAPFILE" || dd if=/dev/zero of="$SWAPFILE" bs=1M count="$((SWAP_SIZE_GIB * 1024))"
+    chmod 600 "$SWAPFILE"
+    mkswap "$SWAPFILE"
+  fi
+
+  if [ -f "$SWAPFILE" ] && ! swapon --show=NAME --noheadings | grep -qxF "$SWAPFILE"; then
+    swapon "$SWAPFILE"
+  fi
+
+  if [ -f "$SWAPFILE" ]; then
+    install -d -m 0755 "$(dirname "$FSTAB")"
+    touch "$FSTAB"
+    if ! awk -v path="$SWAPFILE" '$1 == path && $2 == "none" && $3 == "swap" { found = 1 } END { exit found ? 0 : 1 }' "$FSTAB"; then
+      printf '%s none swap sw 0 0\n' "$SWAPFILE" >> "$FSTAB"
+    fi
+  fi
+}
+
+converge_sysctl() {
+  local desired_sysctl
+
+  desired_sysctl="$(mktemp)"
+  cat > "$desired_sysctl" <<EOF
+vm.swappiness=${SWAPPINESS}
+EOF
+
+  install -d -m 0755 "$(dirname "$SYSCTL_CONF")"
+  if [ ! -f "$SYSCTL_CONF" ] || ! cmp -s "$desired_sysctl" "$SYSCTL_CONF"; then
+    install -m 0644 "$desired_sysctl" "$SYSCTL_CONF"
+    sysctl -p "$SYSCTL_CONF"
+  else
+    echo "sysctl: already converged"
+  fi
+  rm -f "$desired_sysctl"
+}
+
+export DEBIAN_FRONTEND=noninteractive
+
+oomd_unit_present() {
+  systemctl cat systemd-oomd.service >/dev/null 2>&1
+}
+
+ensure_oomd_unit() {
+  if oomd_unit_present; then
+    return 0
+  fi
+
+  apt-get update
+  if apt-cache show systemd-oomd >/dev/null 2>&1; then
+    apt-get install -y systemd-oomd
+  else
+    echo "WARN: systemd-oomd package not available from apt; checking for built-in unit" >&2
+  fi
+
+  if ! oomd_unit_present; then
+    echo "FATAL: systemd-oomd.service unit not present after package check; verify Ubuntu/systemd packaging" >&2
+    exit 1
+  fi
+}
+
+systemctl_value() {
+  local property="$1"
+  systemctl show user.slice -p "$property" --value 2>/dev/null || true
+}
+
+converge_oomd() {
+  local desired_oomd oomd_conf_changed legacy_dropin_removed dropins_changed oomd_active
+  local current_pressure current_limit current_swap desired_dropin
+
+  desired_oomd="$(mktemp)"
+  cat > "$desired_oomd" <<EOF
+[OOM]
+SwapUsedLimit=${OOMD_SWAP_USED_LIMIT}
+EOF
+
+  install -d -m 0755 "$OOMD_CONF_DIR"
+  oomd_conf_changed=false
+  if [ ! -f "$OOMD_CONF" ] || ! cmp -s "$desired_oomd" "$OOMD_CONF"; then
+    install -m 0644 "$desired_oomd" "$OOMD_CONF"
+    oomd_conf_changed=true
+  else
+    echo "oomd backstop config: already converged"
+  fi
+  rm -f "$desired_oomd"
+
+  legacy_dropin_removed=false
+  if [ -f "$LEGACY_USER_SLICE_DROPIN" ]; then
+    rm -f "$LEGACY_USER_SLICE_DROPIN"
+    legacy_dropin_removed=true
+  fi
+
+  dropins_changed=false
+  if [ "$EARLYOOM_ENABLED" = true ]; then
+    # Neutralize Ubuntu's stock 50% pressure-kill on user@N.service — the rule
+    # behind the cgroup-level kill event this concern exists to prevent.
+    # Reached only AFTER converge_earlyoom verified an active earlyoom.
+    desired_dropin="$(mktemp)"
+    printf '[Service]\nManagedOOMMemoryPressure=auto\n' > "$desired_dropin"
+    install -d -m 0755 "$(dirname "$USER_SERVICE_DROPIN")"
+    if [ ! -f "$USER_SERVICE_DROPIN" ] || ! cmp -s "$desired_dropin" "$USER_SERVICE_DROPIN"; then
+      install -m 0644 "$desired_dropin" "$USER_SERVICE_DROPIN"
+      dropins_changed=true
+    fi
+    # The retained swap backstop should deprioritize SSH login sessions.
+    printf '[Scope]\nManagedOOMPreference=avoid\n' > "$desired_dropin"
+    install -d -m 0755 "$(dirname "$SESSION_SCOPE_DROPIN")"
+    if [ ! -f "$SESSION_SCOPE_DROPIN" ] || ! cmp -s "$desired_dropin" "$SESSION_SCOPE_DROPIN"; then
+      install -m 0644 "$desired_dropin" "$SESSION_SCOPE_DROPIN"
+      dropins_changed=true
+    fi
+    rm -f "$desired_dropin"
+  fi
+
+  # user.slice keeps the swap backstop; the pressure config was persisted by
+  # previous converges via set-property, so it must be actively reset.
+  current_pressure="$(systemctl_value ManagedOOMMemoryPressure)"
+  current_limit="$(systemctl_value ManagedOOMMemoryPressureLimit)"
+  current_swap="$(systemctl_value ManagedOOMSwap)"
+  if [ "$current_pressure" != "auto" ] \
+    || { [ -n "$current_limit" ] && [ "$current_limit" != "0" ]; } \
+    || [ "$current_swap" != "kill" ]; then
+    systemctl set-property user.slice \
+      ManagedOOMMemoryPressure=auto \
+      ManagedOOMMemoryPressureLimit=0% \
+      ManagedOOMSwap=kill
+  else
+    echo "user.slice oomd properties: already converged"
+  fi
+
+  if [ "$oomd_conf_changed" = true ] || [ "$legacy_dropin_removed" = true ] || [ "$dropins_changed" = true ]; then
+    systemctl daemon-reload
+  fi
+
+  systemctl enable systemd-oomd
+
+  oomd_active=true
+  if ! systemctl is-active --quiet systemd-oomd; then
+    oomd_active=false
+  fi
+
+  if [ "$oomd_conf_changed" = true ] || [ "$oomd_active" = false ]; then
+    systemctl restart systemd-oomd
+  else
+    echo "systemd-oomd: already active with converged backstop"
+  fi
+}
+
+earlyoom_expected_args() {
+  printf '%s' "-m ${EARLYOOM_MEM_PCT} -s ${EARLYOOM_SWAP_PCT} -r 3600 --avoid ${EARLYOOM_AVOID_REGEX}"
+}
+
+# Strict parse: exactly one non-empty EARLYOOM_ARGS line, or fail. Callers
+# must treat a parse failure as "configuration unknown" — never as a
+# wildcard (an empty expectation would match every argv).
+earlyoom_args_from_config() {
+  local assignments args
+
+  assignments="$(sed -n '/^EARLYOOM_ARGS=/p' "$1" 2>/dev/null || true)"
+  if [ -z "$assignments" ] || [ "$(printf '%s\n' "$assignments" | wc -l)" -ne 1 ]; then
+    return 1
+  fi
+  args="$(printf '%s\n' "$assignments" | sed -n 's/^EARLYOOM_ARGS="\([^"][^"]*\)"$/\1/p')"
+  if [ -z "$args" ]; then
+    return 1
+  fi
+  printf '%s' "$args"
+}
+
+# Step-6 assertions: active, argv EXACTLY the rendered config, version 1.7.x.
+earlyoom_assert() {
+  local expected_args="$1" main_pid cmdline failure_kind
+  local attempt=1 max_attempts=20
+  local verified=false
+
+  if [ -z "$expected_args" ]; then
+    echo "ERROR: refusing to verify earlyoom against an empty argument list" >&2
+    return 1
+  fi
+  # systemctl start can return while MainPID is still systemd-executor and
+  # /proc/<pid>/cmdline is "(earlyoom)". Give that same PID a bounded window
+  # to exec, while continuing to fail closed if the unit, PID, or argv never
+  # reaches the verified state.
+  while [ "$attempt" -le "$max_attempts" ]; do
+    main_pid=""
+    cmdline=""
+    if ! systemctl is-active --quiet earlyoom; then
+      failure_kind=inactive
+    elif ! main_pid="$(systemctl show earlyoom -p MainPID --value)"; then
+      failure_kind=pid-query
+    elif [ -z "$main_pid" ] || [ "$main_pid" = "0" ]; then
+      failure_kind=no-pid
+    else
+      # /proc/<pid>/cmdline NUL-terminates every arg, so the join carries a
+      # trailing space. EXACT equality, executable included: extra flags
+      # after the expected set would override it (last flag wins).
+      cmdline="$(tr '\0' ' ' < "$PROC_DIR/$main_pid/cmdline" 2>/dev/null || true)"
+      if [ "$cmdline" = "/usr/bin/earlyoom $expected_args " ]; then
+        verified=true
+        break
+      fi
+      failure_kind=argv
+    fi
+
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      sleep 0.05
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  if [ "$verified" = false ]; then
+    case "$failure_kind" in
+      inactive)
+        echo "ERROR: earlyoom is not active" >&2
+        ;;
+      pid-query)
+        echo "ERROR: could not query earlyoom MainPID" >&2
+        ;;
+      no-pid)
+        echo "ERROR: earlyoom has no MainPID" >&2
+        ;;
+      argv)
+        echo "ERROR: running earlyoom argv is not exactly the rendered config: $cmdline" >&2
+        ;;
+    esac
+    return 1
+  fi
+  # --avoid is -300-bias semantics in 1.7 only; 1.8 changed the flag set —
+  # belt-and-braces against a hold bypass.
+  if ! earlyoom -v 2>&1 | grep -Eq '(^|[^0-9.])1\.7(\.[0-9]+)?([^0-9.]|$)'; then
+    echo "ERROR: earlyoom version is not 1.7.x" >&2
+    return 1
+  fi
+}
+
+earlyoom_armed=false
+earlyoom_snapshot=""
+earlyoom_snapshot_ready=false
+earlyoom_config_replaced=false
+
+systemctl_property() {
+  local unit="$1" property="$2" value
+
+  if ! value="$(systemctl show "$unit" -p "$property" --value)"; then
+    echo "ERROR: could not query $unit $property" >&2
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+oomd_is_verified_active() {
+  if ! systemctl is-active --quiet systemd-oomd; then
+    echo "ERROR: systemd-oomd is not active" >&2
+    return 1
+  fi
+}
+
+ensure_oomd_active() {
+  if ! systemctl enable --now systemd-oomd; then
+    echo "ERROR: could not enable/start systemd-oomd" >&2
+    return 1
+  fi
+  if ! oomd_is_verified_active; then
+    echo "ERROR: systemd-oomd did not become a verified responder" >&2
+    return 1
+  fi
+}
+
+stock_pressure_responder_is_verified() {
+  local pressure
+
+  if ! oomd_is_verified_active; then
+    return 1
+  fi
+  if ! pressure="$(systemctl_property "$USER_SERVICE_UNIT" ManagedOOMMemoryPressure)"; then
+    echo "ERROR: could not verify stock oomd pressure-kill" >&2
+    return 1
+  fi
+  if [ "$pressure" != "kill" ]; then
+    echo "ERROR: stock oomd pressure-kill was not restored (got: ${pressure:-empty})" >&2
+    return 1
+  fi
+}
+
+user_slice_is_final() {
+  local pressure limit swap
+
+  pressure="$(systemctl show user.slice -p ManagedOOMMemoryPressure --value 2>/dev/null)" \
+    || return 1
+  limit="$(systemctl show user.slice -p ManagedOOMMemoryPressureLimit --value 2>/dev/null)" \
+    || return 1
+  swap="$(systemctl show user.slice -p ManagedOOMSwap --value 2>/dev/null)" \
+    || return 1
+  [ "$pressure" = "auto" ] \
+    && { [ -z "$limit" ] || [ "$limit" = "0" ]; } \
+    && [ "$swap" = "kill" ]
+}
+
+verify_final_user_slice() {
+  local pressure limit swap
+
+  if ! pressure="$(systemctl_property user.slice ManagedOOMMemoryPressure)" \
+    || ! limit="$(systemctl_property user.slice ManagedOOMMemoryPressureLimit)" \
+    || ! swap="$(systemctl_property user.slice ManagedOOMSwap)"; then
+    echo "ERROR: could not verify final user.slice oomd backstop" >&2
+    return 1
+  fi
+  if [ "$pressure" != "auto" ] \
+    || { [ -n "$limit" ] && [ "$limit" != "0" ]; } \
+    || [ "$swap" != "kill" ]; then
+    echo "ERROR: final user.slice oomd backstop is not auto/cleared/kill" >&2
+    return 1
+  fi
+}
+
+verify_emergency_user_slice() {
+  local pressure limit swap
+
+  if ! pressure="$(systemctl_property user.slice ManagedOOMMemoryPressure)" \
+    || ! limit="$(systemctl_property user.slice ManagedOOMMemoryPressureLimit)" \
+    || ! swap="$(systemctl_property user.slice ManagedOOMSwap)"; then
+    echo "ERROR: could not verify emergency user.slice responder" >&2
+    return 1
+  fi
+  if [ "$pressure" != "kill" ] \
+    || [ "$limit" != "$EMERGENCY_OOMD_PRESSURE_LIMIT_NORMALIZED" ] \
+    || [ "$swap" != "kill" ]; then
+    echo "ERROR: emergency user.slice responder is not exact kill/70%/kill" >&2
+    return 1
+  fi
+}
+
+activate_emergency_oomd_pressure() {
+  if ! systemctl set-property user.slice \
+    ManagedOOMMemoryPressure=kill \
+    ManagedOOMMemoryPressureLimit=70% \
+    ManagedOOMSwap=kill; then
+    echo "ERROR: could not establish emergency user.slice pressure policy" >&2
+    return 1
+  fi
+  if ! ensure_oomd_active; then
+    echo "ERROR: emergency user.slice policy retained, but oomd activation failed" >&2
+    return 1
+  fi
+  if ! verify_emergency_user_slice; then
+    echo "ERROR: emergency user.slice policy could not be verified" >&2
+    return 1
+  fi
+}
+
+earlyoom_is_verified() {
+  local args
+
+  args="$(earlyoom_args_from_config "$EARLYOOM_DEFAULT")" || return 1
+  earlyoom_assert "$args" >/dev/null 2>&1
+}
+
+stock_oomd_final_is_verified() {
+  [ ! -f "$USER_SERVICE_DROPIN" ] || return 1
+  [ ! -f "$SESSION_SCOPE_DROPIN" ] || return 1
+  stock_pressure_responder_is_verified >/dev/null 2>&1 \
+    && user_slice_is_final
+}
+
+restore_final_user_slice() {
+  if ! user_slice_is_final; then
+    if ! systemctl set-property user.slice \
+      ManagedOOMMemoryPressure=auto \
+      ManagedOOMMemoryPressureLimit=0% \
+      ManagedOOMSwap=kill; then
+      echo "ERROR: could not restore final user.slice oomd backstop" >&2
+      return 1
+    fi
+  fi
+  verify_final_user_slice
+}
+
+report_emergency_reactivation() {
+  local failure="$1"
+
+  if activate_emergency_oomd_pressure >/dev/null 2>&1; then
+    echo "ERROR: $failure; emergency policy re-applied and verified" >&2
+  else
+    echo "ERROR: emergency policy reactivation failed; no responder could be reverified" >&2
+  fi
+}
+
+# Restore Ubuntu's stock pressure responder without ever removing the only
+# verified responder. If earlyoom is unavailable, user.slice is first promoted
+# to a temporary 70% pressure responder; any later failure leaves it in place.
+restore_stock_oomd_pressure() {
+  local emergency_active=false
+
+  if stock_oomd_final_is_verified; then
+    echo "stock oomd pressure responder: already verified"
+    return 0
+  fi
+
+  if earlyoom_is_verified; then
+    if ! ensure_oomd_active; then
+      echo "ERROR: oomd activation failed; verified earlyoom left enabled" >&2
+      return 1
+    fi
+  else
+    if ! activate_emergency_oomd_pressure; then
+      echo "ERROR: no live rollback responder could be verified" >&2
+      return 1
+    fi
+    emergency_active=true
+  fi
+
+  if ! rm -f "$USER_SERVICE_DROPIN" "$SESSION_SCOPE_DROPIN"; then
+    echo "ERROR: could not remove oomd demotion drop-ins; current responder retained" >&2
+    return 1
+  fi
+  if ! systemctl daemon-reload; then
+    echo "ERROR: systemd daemon-reload failed; current responder retained" >&2
+    return 1
+  fi
+  if ! stock_pressure_responder_is_verified; then
+    echo "ERROR: could not verify stock oomd pressure-kill; current responder retained" >&2
+    return 1
+  fi
+
+  if ! restore_final_user_slice; then
+    if [ "$emergency_active" = true ]; then
+      report_emergency_reactivation "final backstop restore failed"
+    fi
+    return 1
+  fi
+  if ! stock_pressure_responder_is_verified; then
+    if [ "$emergency_active" = true ]; then
+      report_emergency_reactivation "final stock verification failed"
+    fi
+    return 1
+  fi
+}
+
+# A pre-handoff failure must verify the responder that was already in force,
+# but must not normalize legacy user.slice policy as a deliberate rollback
+# would. The concrete user unit exposes its effective policy even while its
+# user manager is inactive.
+verify_prehandoff_stock_oomd_pressure() {
+  if ! stock_pressure_responder_is_verified; then
+    echo "ERROR: could not verify pre-handoff stock oomd pressure-kill" >&2
+    return 1
+  fi
+}
+
+# Transaction guard: converts any mid-sequence failure into a state with at
+# least one verified pressure responder.
+earlyoom_txn_fail() {
+  local failure_rc=$?
+  local restored_args=""
+  local disable_rc=0 unmask_rc=0
+  local retry_config=false restored=false
+
+  trap - ERR
+  set +e
+
+  echo "ERROR: earlyoom converge failed mid-sequence; recovering" >&2
+  if [ "$earlyoom_armed" = false ]; then
+    # Pre-handoff should still be stock oomd, but verify that live responder
+    # before deliberately stopping a partially started earlyoom. Do not run
+    # full rollback normalization: the old user.slice policy stays intact.
+    if verify_prehandoff_stock_oomd_pressure; then
+      systemctl disable --now earlyoom >/dev/null 2>&1 || disable_rc=$?
+    else
+      disable_rc=125
+    fi
+    systemctl unmask earlyoom >/dev/null 2>&1 || unmask_rc=$?
+    if [ "$disable_rc" -eq 0 ] && [ "$unmask_rc" -eq 0 ]; then
+      echo "earlyoom stopped and disabled; old oomd policy intact and stock oomd responder verified" >&2
+    else
+      echo "ERROR: earlyoom pre-handoff cleanup incomplete (disable rc=$disable_rc, unmask rc=$unmask_rc); no unverified responder was deliberately stopped" >&2
+    fi
+  else
+    # Already armed: oomd pressure is demoted — a dead earlyoom would mean
+    # no pressure responder. Restore last-known-good, else stock oomd.
+    if [ "$earlyoom_config_replaced" = false ]; then
+      # The current config was never replaced, so it remains retryable.
+      retry_config=true
+    elif [ "$earlyoom_snapshot_ready" = true ] \
+      && [ -n "$earlyoom_snapshot" ] \
+      && [ -f "$earlyoom_snapshot" ] \
+      && install -m 0644 "$earlyoom_snapshot" "$EARLYOOM_DEFAULT"; then
+      # A replacement is retryable only after the prior config is restored.
+      retry_config=true
+    fi
+
+    if [ "$retry_config" = true ]; then
+      systemctl restart earlyoom >/dev/null 2>&1
+      # A missing/unparseable config is "configuration unknown", never a
+      # wildcard — earlyoom_args_from_config fails and we fall through.
+      restored_args="$(earlyoom_args_from_config "$EARLYOOM_DEFAULT")" || restored_args=""
+      if [ -n "$restored_args" ] && earlyoom_assert "$restored_args"; then
+        restored=true
+        echo "earlyoom restored on last-known-good config; converge aborted" >&2
+      fi
+    fi
+    if [ "$restored" = false ]; then
+      echo "earlyoom unrevivable; restoring stock oomd pressure-kill" >&2
+      # Re-enable and verify a pressure responder before stopping earlyoom.
+      # Task 7 deliberately reuses this load-bearing rollback helper.
+      if restore_stock_oomd_pressure; then
+        if systemctl is-active --quiet earlyoom \
+          || systemctl is-enabled --quiet earlyoom 2>/dev/null; then
+          systemctl disable --now earlyoom >/dev/null 2>&1
+        fi
+      else
+        echo "ERROR: stock oomd recovery failed; refusing to disable earlyoom" >&2
+      fi
+    fi
+  fi
+  if [ -n "$earlyoom_snapshot" ]; then
+    rm -f "$earlyoom_snapshot"
+  fi
+  exit "$failure_rc"
+}
+
+converge_earlyoom() {
+  local desired changed=false installed=false expected_args
+
+  earlyoom_armed=false
+  earlyoom_snapshot=""
+  earlyoom_snapshot_ready=false
+  earlyoom_config_replaced=false
+  if [ -f "$USER_SERVICE_DROPIN" ]; then
+    earlyoom_armed=true
+  elif ! stock_pressure_responder_is_verified >/dev/null 2>&1; then
+    # A failed prior reload can remove the file while leaving the live policy
+    # demoted. Unknown live state is treated as armed so recovery never assumes
+    # an old responder that it did not verify.
+    earlyoom_armed=true
+  fi
+  if dpkg-query -W -f '${Status}' earlyoom 2>/dev/null \
+    | awk '$2 == "ok" && $3 == "installed" { found = 1 } END { exit found ? 0 : 1 }'; then
+    installed=true
+  fi
+
+  trap earlyoom_txn_fail ERR
+
+  if [ "$installed" = false ]; then
+    # Mask BEFORE install: the noble postinst runs deb-systemd-invoke start,
+    # which respects masking — earlyoom never runs the packaged default
+    # thresholds. Pre-writing the conffile instead would trigger dpkg's
+    # interactive conffile prompt and EOF-fail an unattended converge.
+    systemctl mask earlyoom
+    apt-get update
+    apt-get install -y earlyoom
+  fi
+  # 1.7-specific flag semantics: block surprise upgrades outright.
+  apt-mark hold earlyoom
+
+  expected_args="$(earlyoom_expected_args)"
+  desired="$(mktemp)"
+  printf 'EARLYOOM_ARGS="%s"\n' "$expected_args" > "$desired"
+  install -d -m 0755 "$(dirname "$EARLYOOM_DEFAULT")"
+  if [ ! -f "$EARLYOOM_DEFAULT" ] || ! cmp -s "$desired" "$EARLYOOM_DEFAULT"; then
+    if [ "$earlyoom_armed" = true ]; then
+      earlyoom_config_replaced=true
+      if [ -f "$EARLYOOM_DEFAULT" ]; then
+        # Armed box: keep the last-known-good config for the trap to restore.
+        earlyoom_snapshot="$(mktemp)"
+        cp "$EARLYOOM_DEFAULT" "$earlyoom_snapshot"
+        earlyoom_snapshot_ready=true
+      fi
+    fi
+    install -m 0644 "$desired" "$EARLYOOM_DEFAULT"
+    changed=true
+  else
+    echo "earlyoom config: already converged"
+  fi
+  rm -f "$desired"
+
+  systemctl unmask earlyoom
+  if [ "$changed" = true ] && systemctl is-active --quiet earlyoom; then
+    systemctl restart earlyoom
+  fi
+  systemctl enable --now earlyoom
+  earlyoom_assert "$expected_args"
+  if [ -n "$earlyoom_snapshot" ]; then
+    rm -f "$earlyoom_snapshot"
+  fi
+  trap - ERR
+}
+
+# Rollback: restore and verify stock oomd pressure-kill before stopping
+# earlyoom. restore_stock_oomd_pressure owns the load-bearing policy transition
+# used by both deliberate rollback and transaction recovery.
+rollback_earlyoom() {
+  restore_stock_oomd_pressure
+
+  if systemctl is-active --quiet earlyoom \
+    || systemctl is-enabled --quiet earlyoom 2>/dev/null; then
+    systemctl disable --now earlyoom
+  else
+    echo "earlyoom rollback: already disabled"
+  fi
+}
+
+ensure_swap
+converge_sysctl
+ensure_oomd_unit
+if [ "$EARLYOOM_ENABLED" = true ]; then
+  converge_earlyoom
+else
+  rollback_earlyoom
+fi
+converge_oomd
+
+memory_env_sha="$(
+  printf 'swap_size_gib=%s\nswappiness=%s\nroot_free_reserve_gib=%s\nearlyoom_enabled=%s\nearlyoom_mem_pct=%s\nearlyoom_swap_pct=%s\nearlyoom_avoid_regex=%s\n' \
+    "$SWAP_SIZE_GIB" \
+    "$SWAPPINESS" \
+    "$ROOT_FREE_RESERVE_GIB" \
+    "$EARLYOOM_ENABLED" \
+    "$EARLYOOM_MEM_PCT" \
+    "$EARLYOOM_SWAP_PCT" \
+    "$EARLYOOM_AVOID_REGEX" | sha256_text
+)"
+oomd_conf_sha="$(
+  printf 'pressure=auto\nswap=kill\nswap_used_limit=%s\n' \
+    "$OOMD_SWAP_USED_LIMIT" | sha256_text
+)"
+write_marker_if_changed "$STATE_DIR/memory.env.sha256" "$memory_env_sha"
+write_marker_if_changed "$STATE_DIR/oomd.conf.sha256" "$oomd_conf_sha"
+
+swapon --show
+free -h
+df -h /
+sysctl vm.swappiness
+systemctl is-active systemd-oomd
+systemctl show user.slice -p ManagedOOMMemoryPressure -p ManagedOOMMemoryPressureLimit -p ManagedOOMSwap
+if [ "$EARLYOOM_ENABLED" = true ]; then
+  systemctl is-active earlyoom
+  cat "$EARLYOOM_DEFAULT"
+fi

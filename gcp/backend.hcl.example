@@ -1,0 +1,5 @@
+# Partial backend config for gcp/versions.tf's empty `backend "gcs" {}`.
+# Copy to backend.hcl (gitignored), set your bucket, then:
+#   terraform init -backend-config=backend.hcl
+bucket = "your-tfstate-bucket"
+prefix = "gcp"

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# AWS credential_process helper: exchanges a GCP identity token for the shared
+# devbox-gcp-workload role, keylessly and on demand — no token files go stale
+# on disk. RoleSessionName=$(hostname) is a BEST-EFFORT operational label, not
+# attribution evidence (caller-supplied; the signed identity is the shared
+# instance SA).
+set -euo pipefail
+
+# Recursion guard (learned on the first canary): SDKs and the AWS CLI invoke
+# credential_process with the CALLER's environment. If AWS_PROFILE — or a
+# config-file override — points back at the profile whose credential_process
+# is this helper, the inner `aws sts` call below re-enters it and forks
+# without bound (observed: >1,300 concurrent helpers wedged the box). The STS
+# call is unsigned and receives everything via flags — the inner CLI must run
+# with no profile and no shared-config overrides.
+unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE
+
+CONFIG="${DEVBOX_BEDROCK_CONFIG:-/etc/devbox/bedrock.json}"
+METADATA_URL="${DEVBOX_METADATA_URL:-http://metadata.google.internal/computeMetadata/v1}"
+
+if [ ! -f "$CONFIG" ]; then
+  echo "FATAL: $CONFIG not found — federation not configured yet (devbox-bedrock-config runs via converge once the manifest carries bedrock keys)" >&2
+  exit 1
+fi
+
+role_arn="$(jq -re .role_arn "$CONFIG")"
+region="$(jq -re .region "$CONFIG")"
+audience="$(jq -re .audience "$CONFIG")"
+
+# format=full includes the sub/azp claims AWS's condition keys match on.
+token="$(curl -fsS -H 'Metadata-Flavor: Google' \
+  "$METADATA_URL/instance/service-accounts/default/identity?audience=${audience}&format=full")"
+if [ -z "$token" ]; then
+  echo "FATAL: empty identity token from metadata server" >&2
+  exit 1
+fi
+
+# Unsigned STS call — no pre-existing AWS credentials are needed or used.
+aws sts assume-role-with-web-identity \
+  --region "$region" \
+  --role-arn "$role_arn" \
+  --role-session-name "$(hostname)" \
+  --web-identity-token "$token" \
+  --duration-seconds 43200 \
+  --output json \
+  | jq '{Version: 1, AccessKeyId: .Credentials.AccessKeyId, SecretAccessKey: .Credentials.SecretAccessKey, SessionToken: .Credentials.SessionToken, Expiration: .Credentials.Expiration}'

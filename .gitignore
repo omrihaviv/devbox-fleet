@@ -1,0 +1,33 @@
+# Terraform state stays wherever each root's backend puts it; never commit it.
+# The dependency lock (.terraform.lock.hcl) IS committed: without it,
+# different admin machines select different provider versions on init, and
+# minor provider drift can change auth-key expiry semantics or disk
+# lifecycle behavior with no diff.
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Saved Terraform plans contain the fully evaluated configuration and can
+# embed sensitive variable values. Never leave one eligible for `git add`.
+tfplan
+*.tfplan
+*.tfplan.*
+
+# Real per-org configuration. The *.example templates ARE committed — this
+# pattern matches only the exact filename `terraform.tfvars`, never
+# `*.tfvars.example`.
+**/terraform.tfvars
+
+# Org-specific partial backend config (gcp/backend.hcl.example IS committed).
+gcp/backend.hcl
+
+# Org-specific repo list (scripts/devbox-repos.example IS committed).
+scripts/devbox-repos.default
+
+# Local isolated implementation worktrees.
+.worktrees/
+
+# Editor / OS junk
+.DS_Store
+*.swp
+*.swo

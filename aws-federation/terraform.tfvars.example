@@ -1,0 +1,8 @@
+aws_account_id = "123456789012" # REPLACE with your AWS account ID
+
+# From the GCP root, AFTER its first apply:
+#   terraform -chdir=gcp output -raw devbox_instance_sa_unique_id
+sa_unique_id = "REPLACE_WITH_NUMERIC_ID"
+
+# Must equal gcp/variables.tf var.aws_federation_audience (default shown).
+audience = "devbox-fleet-aws-federation"

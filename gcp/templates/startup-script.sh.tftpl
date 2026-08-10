@@ -1,0 +1,385 @@
+#!/bin/bash
+# shellcheck shell=bash
+# shellcheck disable=SC2154  # variables come from Terraform's templatefile()
+#
+# Devbox startup script for ${dev_name}-devbox. Generation: ${generation}
+# Templated by gcp/compute.tf via templatefile().
+#
+# GCE runs this on EVERY boot (unlike cloud-init user-data). Two parts:
+#   PART A — storage assertions: every boot, unconditionally. Stateful
+#            daemons must never run against bare root-disk directories.
+#   PART B — one-time provisioning: gated by the ROOT-DISK marker
+#            /var/lib/devbox-bootstrap/complete (never /data — the data
+#            disk survives rebuilds and would wrongly skip bootstrap of a
+#            replacement instance). Marker write is the LAST step, so a
+#            mid-bootstrap crash retries the whole sequence next boot (the
+#            24h reusable auth key exists to survive exactly that).
+
+set -euo pipefail
+exec > >(tee -a /var/log/devbox-startup.log) 2>&1
+echo "=== devbox startup at $(date -u --iso-8601=seconds) ==="
+
+# ===================== PART A: every-boot storage assertions ==============
+BY_ID="/dev/disk/by-id/google-data"
+
+echo "Waiting for data disk at $BY_ID (up to ~2min)..."
+for _ in $(seq 1 60); do
+  [ -e "$BY_ID" ] && break
+  sleep 2
+done
+if [ ! -e "$BY_ID" ]; then
+  echo "FATAL: data disk never appeared at $BY_ID — refusing to start stateful services" >&2
+  exit 1
+fi
+
+DEV="$(readlink -f "$BY_ID")"
+
+SIGS="$(wipefs -n -- "$DEV" | tail -n +2)"
+set +e
+FSTYPE="$(blkid -s TYPE -o value "$DEV")"
+BLKID_RC=$?
+set -e
+case "$BLKID_RC" in
+  0) ;;
+  2) FSTYPE="" ;;
+  *)
+    echo "FATAL: blkid on $DEV returned unexpected exit $BLKID_RC. Refusing to make a" >&2
+    echo "       format/mount decision under uncertain probe state. Investigate via IAP" >&2
+    echo "       breakglass; wipefs -a $DEV manually ONLY if the data is disposable." >&2
+    exit 1
+    ;;
+esac
+
+if [ -z "$SIGS" ] && [ -z "$FSTYPE" ]; then
+  echo "data disk is blank — formatting $DEV as ext4..."
+  mkfs.ext4 "$DEV"
+elif [ "$FSTYPE" = "ext4" ]; then
+  echo "data disk already ext4 — mounting as-is"
+else
+  echo "FATAL: $DEV has unexpected on-disk content (FSTYPE='$FSTYPE'). Refusing to" >&2
+  echo "       reformat. Investigate via IAP breakglass." >&2
+  exit 1
+fi
+
+UUID="$(blkid -s UUID -o value "$DEV")"
+mkdir -p /data
+if ! grep -q "UUID=$UUID" /etc/fstab; then
+  echo "UUID=$UUID /data ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+mountpoint -q /data || mount /data
+
+mkdir -p /data/home /data/docker /data/containerd /data/tailscale
+mkdir -p /var/lib/docker /var/lib/containerd /var/lib/tailscale
+chown root:root /var/lib/docker /var/lib/containerd /var/lib/tailscale
+chmod 0700 /var/lib/docker /var/lib/containerd /var/lib/tailscale
+
+for entry in \
+  "/data/home /home none bind 0 0" \
+  "/data/docker /var/lib/docker none bind 0 0" \
+  "/data/containerd /var/lib/containerd none bind 0 0" \
+  "/data/tailscale /var/lib/tailscale none bind 0 0"; do
+  grep -qF "$entry" /etc/fstab || echo "$entry" >> /etc/fstab
+done
+mount -a
+
+for mp in /data /home /var/lib/docker /var/lib/containerd /var/lib/tailscale; do
+  if ! mountpoint -q "$mp"; then
+    echo "FATAL: $mp is not a mountpoint after mount -a — stateful daemons stay down" >&2
+    echo "       (RequiresMountsFor= drop-ins hold them back at the systemd level too)" >&2
+    exit 1
+  fi
+done
+echo "All bind mounts verified"
+
+# ===================== PART B: one-time provisioning ======================
+if [ -f /var/lib/devbox-bootstrap/complete ]; then
+  echo "bootstrap already complete ($(cat /var/lib/devbox-bootstrap/complete)); storage verified — done"
+  exit 0
+fi
+
+# ----- B1: hostname -----
+hostnamectl set-hostname "${dev_name}-devbox"
+sed -i '/^127\.0\.1\.1/d' /etc/hosts
+echo "127.0.1.1 ${dev_name}-devbox" >> /etc/hosts
+
+# ----- B2: apt baseline (jq is needed for the GCS token fetch below) -----
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y curl ca-certificates gnupg lsb-release unzip jq
+
+# ----- B3: dev user -----
+if ! id dev >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash --groups sudo dev
+fi
+echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-dev
+chmod 0440 /etc/sudoers.d/90-dev
+
+# ----- B4: RequiresMountsFor drop-ins (systemd-level mount enforcement) -----
+# Written BEFORE the daemons are installed: systemd reads drop-ins when a
+# unit loads, so tailscaled/docker/containerd get them from first start. A
+# mount that fails or hangs on a later boot holds these services back
+# rather than letting them write to the disposable root disk (design §6).
+for unit in tailscaled docker containerd; do
+  install -d -m 0755 "/etc/systemd/system/$unit.service.d"
+  cat > "/etc/systemd/system/$unit.service.d/10-devbox-mounts.conf" <<'MOUNTS_EOF'
+[Unit]
+RequiresMountsFor=/data /home /var/lib/docker /var/lib/containerd /var/lib/tailscale
+MOUNTS_EOF
+done
+systemctl daemon-reload
+
+# ----- B5: Tailscale (FIRST, so the box is reachable early) -----
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+  | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+  | tee /etc/apt/sources.list.d/tailscale.list
+apt-get update
+apt-get install -y "tailscale=${tailscale_version}"
+systemctl enable --now tailscaled
+
+tailscale up \
+  --auth-key="${ts_auth_key}" \
+  --hostname="${dev_name}-devbox" \
+  --ssh \
+  --operator=dev \
+  --advertise-tags="tag:devbox-${dev_name}"
+echo "Tailscale up — box is reachable via Tailscale SSH"
+
+tailscale serve --yes --bg --tcp=9222 tcp://127.0.0.1:9222
+echo "Tailscale serve: 9222 → 127.0.0.1:9222 (chrome-steered CDP)"
+
+# ----- B6: runtime bucket pointer + converge bootstrap -----
+install -d -m 0755 /etc/devbox
+printf '%s\n' "${runtime_bucket}" > /etc/devbox/runtime-bucket
+
+# Arm VS Code before the first manifest fetch. Bootstrap completion is written
+# even when that fetch fails, so the retry marker must already exist for a
+# later timer-driven convergence to install it.
+install -d -m 0755 /var/lib/devbox-runtime
+touch /var/lib/devbox-runtime/vscode-required
+
+# Fetch ONLY devbox-converge here (manifest pointer → verify by manifest
+# sha); converge itself fetches/verifies the rest of the bundle. Plain
+# curl + metadata token — no gcloud/aws CLI in the boot path.
+gcs_token() {
+  curl -fsS -H 'Metadata-Flavor: Google' \
+    'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+    | jq -r .access_token
+}
+converge_bootstrap_ok=false
+manifest_tmp="$(mktemp)"
+if curl -fsSL -H "Authorization: Bearer $(gcs_token)" \
+     -o "$manifest_tmp" "https://storage.googleapis.com/${runtime_bucket}/runtime/manifest.json"; then
+  converge_key="$(jq -r '.scripts["devbox-converge"].key' "$manifest_tmp")"
+  converge_sha="$(jq -r '.scripts["devbox-converge"].sha256' "$manifest_tmp")"
+  converge_tmp="$(mktemp)"
+  if curl -fsSL -H "Authorization: Bearer $(gcs_token)" \
+       -o "$converge_tmp" "https://storage.googleapis.com/${runtime_bucket}/$converge_key" \
+     && echo "$converge_sha  $converge_tmp" | sha256sum -c -; then
+    install -o root -g root -m 0755 "$converge_tmp" /usr/local/bin/devbox-converge
+    converge_bootstrap_ok=true
+  else
+    echo "WARN: devbox-converge fetch/verify failed; the timer will retry" >&2
+  fi
+  rm -f "$converge_tmp"
+else
+  echo "WARN: manifest fetch failed (is runtime/manifest.json promoted?); the timer will retry" >&2
+fi
+rm -f "$manifest_tmp"
+
+# ----- B7: converge service + timer (8h, randomized, persistent) -----
+cat > /etc/systemd/system/devbox-converge.service <<'CONVERGE_SVC_EOF'
+[Unit]
+Description=Devbox runtime convergence (manifest pull from GCS)
+Wants=network-online.target
+After=network-online.target tailscaled.service
+RequiresMountsFor=/data /home /var/lib/docker /var/lib/containerd /var/lib/tailscale
+
+[Service]
+Type=oneshot
+Environment=DEVBOX_ALLOW_TAILSCALE_UPGRADE=0
+ExecStart=/usr/local/bin/devbox-converge
+CONVERGE_SVC_EOF
+
+cat > /etc/systemd/system/devbox-converge.timer <<'CONVERGE_TIMER_EOF'
+[Unit]
+Description=Devbox converge every 8h (one missed cycle stays under the 23h staleness alert)
+
+[Timer]
+OnCalendar=*-*-* 00,08,16:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+CONVERGE_TIMER_EOF
+
+systemctl daemon-reload
+systemctl enable --now devbox-converge.timer
+
+runtime_converge_ok=false
+if [ "$converge_bootstrap_ok" = true ] && /usr/local/bin/devbox-converge; then
+  runtime_converge_ok=true
+else
+  echo "WARN: boot-time converge incomplete; the timer will retry" >&2
+fi
+
+# ----- B8: Chrome wrappers + steerable Chrome service -----
+cat > /usr/local/bin/chrome-devtools-mcp-wrapper <<'CHROME_WRAPPER_EOF'
+${chrome_wrapper_content}
+CHROME_WRAPPER_EOF
+chmod 0755 /usr/local/bin/chrome-devtools-mcp-wrapper
+chown root:root /usr/local/bin/chrome-devtools-mcp-wrapper
+
+if [ "$runtime_converge_ok" = true ]; then
+  for f in /usr/bin/node /usr/lib/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js /usr/bin/google-chrome-stable; do
+    [ -e "$f" ] || { echo "FATAL: chrome-devtools-mcp pinned binary missing: $f" >&2; exit 1; }
+  done
+else
+  echo "WARN: runtime convergence incomplete; skipping chrome-devtools-mcp binary check until the timer retries" >&2
+fi
+
+cat > /usr/local/bin/chrome-devtools-mcp-steered-wrapper <<'STEERED_WRAPPER_EOF'
+${steered_wrapper_content}
+STEERED_WRAPPER_EOF
+chmod 0755 /usr/local/bin/chrome-devtools-mcp-steered-wrapper
+chown root:root /usr/local/bin/chrome-devtools-mcp-steered-wrapper
+
+install -d -o dev -g dev -m 0755 /home/dev/.local
+install -d -o dev -g dev -m 0755 /home/dev/.local/share
+install -d -o dev -g dev -m 0755 /home/dev/.local/share/chrome-steered
+
+cat > /etc/systemd/system/chrome-steered.service <<'CHROME_STEERED_EOF'
+[Unit]
+Description=Steerable headless Chrome with CDP on 127.0.0.1:9222 (shared with chrome-devtools-mcp-steered)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+RequiresMountsFor=/home
+
+[Service]
+User=dev
+Group=dev
+Environment=HOME=/home/dev
+Environment=XDG_RUNTIME_DIR=/run/chrome-steered
+RuntimeDirectory=chrome-steered
+# Clean stale Singleton* lock files: --user-data-dir is on the persistent
+# data disk that survives instance replacement, and Chrome refuses to start
+# when SingletonLock records the previous instance's PID+hostname.
+ExecStartPre=/bin/rm -f /home/dev/.local/share/chrome-steered/SingletonLock /home/dev/.local/share/chrome-steered/SingletonCookie /home/dev/.local/share/chrome-steered/SingletonSocket
+ExecStart=/usr/bin/google-chrome-stable \
+  --headless=new \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-allow-origins=* \
+  --user-data-dir=/home/dev/.local/share/chrome-steered \
+  --disable-gpu \
+  --no-first-run \
+  --no-default-browser-check \
+  about:blank
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+CHROME_STEERED_EOF
+chmod 0644 /etc/systemd/system/chrome-steered.service
+chown root:root /etc/systemd/system/chrome-steered.service
+
+systemctl daemon-reload
+systemctl enable chrome-steered.service
+if [ "$runtime_converge_ok" = true ]; then
+  systemctl restart chrome-steered.service
+else
+  systemctl start chrome-steered.service \
+    || echo "WARN: chrome-steered did not start before runtime convergence; the timer/manual restart recovers after packages land" >&2
+fi
+
+# ----- B9: devbox-onboard + repos default + login hooks -----
+cat > /usr/local/bin/devbox-onboard <<'DEVBOX_ONBOARD_EOF'
+${devbox_onboard_content}
+DEVBOX_ONBOARD_EOF
+chmod 0755 /usr/local/bin/devbox-onboard
+chown root:root /usr/local/bin/devbox-onboard
+
+cat > /etc/devbox-repos.default <<'DEVBOX_REPOS_EOF'
+${devbox_repos_default}
+DEVBOX_REPOS_EOF
+chmod 0644 /etc/devbox-repos.default
+
+cat > /etc/profile.d/00-devbox-onboard.sh <<'PROFILED_EOF'
+# Devbox first-login onboarding (sentinel-gated; safe to re-run via `devbox-onboard`).
+# Root-owned, recreated by every bootstrap; safe to overwrite.
+if [ "$(id -un)" = "dev" ] && [ -t 1 ] && [ ! -f "$HOME/.devbox-onboarded" ]; then
+  /usr/local/bin/devbox-onboard
+fi
+PROFILED_EOF
+chown root:root /etc/profile.d/00-devbox-onboard.sh
+chmod 0644 /etc/profile.d/00-devbox-onboard.sh
+
+if [ ! -f /home/dev/.bash_profile ]; then
+  cat > /home/dev/.bash_profile <<'BASH_PROFILE_EOF'
+# Load .bashrc for interactive shells.
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+BASH_PROFILE_EOF
+  chown dev:dev /home/dev/.bash_profile
+fi
+
+# Opt-in tmux for interactive SSH (see AWS template for full rationale:
+# sorts before 00-devbox-onboard.sh so onboarding fires INSIDE tmux).
+cat > /etc/profile.d/00-devbox-auto-tmux.sh <<'AUTO_TMUX_EOF'
+[ -n "$BASH_VERSION" ] || return 0
+case $- in *i*) ;; *) return ;; esac
+[ -t 0 ] && [ -t 1 ] || return
+[ -n "$SSH_CONNECTION" ] || return
+[ -z "$TMUX" ] || return
+[ -z "$SSH_ORIGINAL_COMMAND" ] || return
+[ -f "$HOME/.auto-tmux" ] || return
+command -v tmux >/dev/null 2>&1 || return
+
+exec tmux new-session -A -s main bash -l
+AUTO_TMUX_EOF
+chown root:root /etc/profile.d/00-devbox-auto-tmux.sh
+chmod 0644 /etc/profile.d/00-devbox-auto-tmux.sh
+
+if [ ! -f /home/dev/.tmux.conf ]; then
+  cat > /home/dev/.tmux.conf <<'TMUX_CONF_EOF'
+# Devbox baseline tmux.conf — overwrite freely; rebuilds preserve your edits.
+set -g default-terminal "tmux-256color"
+set -ga terminal-overrides ",*256col*:Tc"
+set -g mouse on
+set -g history-limit 50000
+set -g base-index 1
+setw -g pane-base-index 1
+set -g renumber-windows on
+set -sg escape-time 10
+setw -g mode-keys vi
+set -g window-size latest
+set -g focus-events on
+set -s set-clipboard on
+bind r source-file ~/.tmux.conf \; display "tmux.conf reloaded"
+set -g status-right "#h  %Y-%m-%d %H:%M"
+set -g status-interval 5
+TMUX_CONF_EOF
+  chown dev:dev /home/dev/.tmux.conf
+fi
+
+# ----- B10: MOTD -----
+cat > /etc/motd <<MOTD_EOF
+Welcome to ${dev_name}-devbox (GCP).
+
+  /usr/local/bin/devbox-onboard  — re-run first-time setup.
+  bclaude                        — Claude Code via Bedrock (opt-in; plain
+                                   claude stays on your personal account).
+  codex                          — uses Bedrock by DEFAULT on devboxes
+                                   (managed block in ~/.codex/config.toml).
+  See docs/dev-quickstart.md for chrome-devtools-mcp tunneling.
+
+Generation ${generation}.
+MOTD_EOF
+
+# ----- B11: completion marker — STRICTLY LAST -----
+install -d -m 0755 /var/lib/devbox-bootstrap
+printf 'generation=%s completed=%s\n' "${generation}" "$(date -u --iso-8601=seconds)" \
+  > /var/lib/devbox-bootstrap/complete
+
+echo "=== devbox bootstrap finished at $(date -u --iso-8601=seconds) ==="

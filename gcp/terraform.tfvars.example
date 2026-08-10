@@ -1,0 +1,83 @@
+gcp_project_id = "your-project-id"
+
+# Pinned image name — check the current one:
+#   gcloud compute images list --project ubuntu-os-cloud \
+#     --filter="family=ubuntu-2404-lts-amd64" --sort-by=~creationTimestamp --limit=3
+ubuntu_2404_image = "ubuntu-2404-noble-amd64-v20260805"
+
+toolchain = {
+  tailscale_version           = "1.86.2"
+  docker_ce_version           = "5:29.0.2-1~ubuntu.24.04~noble"
+  # The GitHub, Chrome, and VS Code apt repos retain/churn their stable package;
+  # "latest" resolves the signed repository candidate at converge time. These
+  # upgrades are intentionally floating and not promotion-gated: an unchanged
+  # manifest can resolve a newer package on a later converge. Mirror the
+  # packages and set retained exact versions if reproducibility is required.
+  gh_version                  = "latest"
+  system_node_version         = "22.14.0-1nodesource1"
+  nvm_version                 = "0.40.3"
+  # sha256 of https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh
+  nvm_install_sha256          = "2d8359a64a3cb07c02389ad88ceecd43f2fa469c06104f92f98df5b6f315275f"
+  node_version                = "22.14.0"
+  google_chrome_version       = "latest"
+  chrome_devtools_mcp_version = "0.6.0"
+  vscode_version              = "latest"
+  aws_cli_version             = "2.34.53"
+  # sha256 of awscli-exe-linux-x86_64-2.34.53.zip from awscli.amazonaws.com
+  aws_cli_install_sha256      = "b06c9865123cf1bc6f8761a0bf3161630e6f55d84363f9fda89535e2cdbe654b"
+  # Optional; default to pinned upstream commits (see gcp/variables.tf).
+  # tmux_resurrect_commit     = "cff343cf9e81983d3da0c8562b01616f12e8d548"
+  # tmux_continuum_commit     = "0698e8f4b17d6454c71bf5212895ec055c578da0"
+}
+
+ops_agent_version = "2.55.0"
+
+# New or rebuilt machines get a 120 GB root disk by default. Terraform
+# intentionally ignores root-disk size after creation; use root_disk_gb on a
+# machine only to choose a different creation size.
+# root_disk_gb = 120
+
+# ---- Tailnet ACL ownership ----
+# WARNING: with manage_tailscale_acl = true this root becomes the SOLE
+# writer of your tailnet's ACL and REPLACES the whole policy document on
+# every apply. Seed tag:devbox-key-minter manually before creating the OAuth
+# client, then follow docs/admin-runbook.md: gate-closed skeleton first, exact
+# gate-open/first-machine policy from a saved plan second.
+manage_tailscale_acl = false
+devs                 = {}
+
+# gcp_region = "us-central1"   # zones below must belong to this region
+# After the preview, machines look like:
+# manage_tailscale_acl = true
+# devs = {
+#   alice = {
+#     github_user     = "alice-example"
+#     tailscale_email = "alice@example.com"
+#     machines = {
+#       primary = { zone = "us-central1-a" }
+#       big     = { zone = "us-central1-a", machine_type = "n2-custom-16-65536", root_disk_gb = 200, data_disk_gb = 300, swap_gib = 32 }
+#     }
+#   }
+# }
+
+# Machines outside this root that must keep tailnet access (rare; empty for
+# a fresh fleet).
+frozen_aws_machines = {}
+
+tailscale_admin_emails        = ["ops@example.com"]
+tailscale_oauth_client_id     = "REPLACE"
+tailscale_oauth_client_secret = "REPLACE"
+tailscale_tailnet             = "example.com"
+
+devbox_admins_group = "devbox-admins@example.com"
+devbox_alert_email  = "ops@example.com"
+
+# ---- Optional: Bedrock access via aws-federation/ (fill after its apply) ----
+# bedrock_role_arn = "arn:aws:iam::123456789012:role/devbox-gcp-workload"
+
+# ---- Optional: MCP servers registered for every dev's Codex at onboarding ----
+# http_headers is NOT a secret store — never put a token or API key here.
+# codex_mcp_connectors = {
+#   tracker = { url = "https://mcp.tracker.example/mcp" }
+#   logs    = { url = "https://logs.example/mcp", http_headers = { "x-mcp-version" = "v2" } }
+# }

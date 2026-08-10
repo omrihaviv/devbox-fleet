@@ -1,0 +1,10 @@
+# Team repos cloned into ~/work at first onboarding. One owner/repo per line;
+# lines starting with # are ignored.
+#
+# Copy this file to devbox-repos.default (gitignored) and list your org's
+# repos. On first onboard the box copies the list to ~/.devbox-repos, which
+# each dev can edit afterwards. Without the file, onboarding just skips
+# cloning.
+#
+# your-org/backend
+# your-org/web

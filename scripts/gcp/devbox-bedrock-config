@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# Bedrock opt-in config concern. Default `claude` stays on the dev's personal
+# account; `bclaude` opts into Bedrock through the federated role. Delivers:
+#   - /etc/devbox/bedrock.json           (read by devbox-aws-creds)
+#   - /etc/claude-code/managed-settings.json
+#                                        (awsCredentialExport → the
+#                                         devbox-aws-creds helper; claude
+#                                         fetches/refreshes creds itself)
+#   - [profile devbox-bedrock]           (appended to ~/.aws/config; the
+#                                         personal `default` profile is
+#                                         NEVER touched)
+#   - seeded block PREPENDED to ~/.codex/config.toml
+#                                        (codex defaults to Bedrock:
+#                                         provider, model, effort, AWS
+#                                         profile+region — hash-gated:
+#                                         dev edits inside it STICK)
+#   - /usr/local/bin/bclaude, /usr/local/bin/bdcc
+#                                        (root-owned executables, not shell
+#                                         functions -- paseo spawns with
+#                                         shell: false, so a function would be
+#                                         unreachable. GATED on the claude
+#                                         success marker: nothing is published
+#                                         until Claude Code install is
+#                                         verified, and that same gate retires
+#                                         any legacy ~/.bashrc block)
+#   - agents.providers.bclaude           (merged into ~/.paseo/config.json,
+#                                         registering bclaude as a selectable
+#                                         Paseo agent; GATED on the same claude
+#                                         success marker, and takes effect only
+#                                         after a dev-initiated daemon restart)
+# NO-OP when the manifest has no .bedrock object — plumbing lands first.
+# Never touches ~/.claude/settings.json.
+set -euo pipefail
+
+STATE_DIR="${DEVBOX_RUNTIME_STATE_DIR:-/var/lib/devbox-runtime}"
+DEV_HOME="${DEVBOX_DEV_HOME:-/home/dev}"
+BEDROCK_CONFIG="${DEVBOX_BEDROCK_CONFIG:-/etc/devbox/bedrock.json}"
+MANIFEST="$STATE_DIR/manifest.json"
+MARK_START="# >>> devbox bedrock >>> (managed by devbox-bedrock-config; edits inside are overwritten)"
+MARK_END="# <<< devbox bedrock <<<"
+
+CLAUDE_SUCCESS_FILE="${DEVBOX_CLAUDE_SUCCESS_FILE:-/var/lib/devbox-runtime/claude-code-installed}"
+CLAUDE_BIN="${DEVBOX_CLAUDE_BIN:-$DEV_HOME/.local/bin/claude}"
+BCLAUDE_BIN="${DEVBOX_BCLAUDE_BIN:-/usr/local/bin/bclaude}"
+BDCC_BIN="${DEVBOX_BDCC_BIN:-/usr/local/bin/bdcc}"
+PASEO_CONFIG_FILE="${DEVBOX_PASEO_CONFIG_FILE:-$DEV_HOME/.paseo/config.json}"
+
+# Every inherited variable that could select a different principal or bypass
+# awsCredentialExport, which is meant to be claude's ONLY credential source.
+# AWS_BEARER_TOKEN_BEDROCK is a Bedrock API key: it authenticates directly and
+# bypasses SigV4 and the hook entirely. The old bashrc block did not strip it.
+# The renderer and the tests both read THIS array, so it cannot drift.
+CREDENTIAL_SELECTORS=(
+  AWS_PROFILE
+  AWS_DEFAULT_PROFILE
+  AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY
+  AWS_SESSION_TOKEN
+  AWS_SECURITY_TOKEN
+  AWS_CREDENTIAL_EXPIRATION
+  AWS_BEARER_TOKEN_BEDROCK
+)
+
+if [ "${DEVBOX_SKIP_ROOT_CHECK:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  echo "FATAL: run as root" >&2
+  exit 1
+fi
+
+if [ ! -f "$MANIFEST" ] || ! jq -e '.bedrock.role_arn' "$MANIFEST" >/dev/null 2>&1; then
+  echo "devbox-bedrock-config: no bedrock keys in manifest; nothing to do"
+  exit 0
+fi
+
+role_arn="$(jq -re .bedrock.role_arn "$MANIFEST")"
+region="$(jq -re .bedrock.region "$MANIFEST")"
+audience="$(jq -re .bedrock.audience "$MANIFEST")"
+
+dev_owner="$(stat -c %U "$DEV_HOME" 2>/dev/null || echo dev)"
+
+install_as_dev() { # path mode content-file
+  install -m "$2" "$3" "$1" 2>/dev/null || { cp "$3" "$1"; chmod "$2" "$1"; }
+  chown "$dev_owner:$dev_owner" "$1" 2>/dev/null || true
+}
+
+# ----- 1. /etc/devbox/bedrock.json -----
+install -d -m 0755 "$(dirname "$BEDROCK_CONFIG")"
+desired_json="$(mktemp)"
+jq -n --arg role_arn "$role_arn" --arg region "$region" --arg audience "$audience" \
+  '{role_arn: $role_arn, region: $region, audience: $audience}' > "$desired_json"
+if [ ! -f "$BEDROCK_CONFIG" ] || ! cmp -s "$desired_json" "$BEDROCK_CONFIG"; then
+  install -m 0644 "$desired_json" "$BEDROCK_CONFIG"
+fi
+rm -f "$desired_json"
+
+# ----- 1b. /etc/claude-code/managed-settings.json (awsCredentialExport) -----
+# Claude Code executes this hook ITSELF: at session start and again whenever
+# the federated creds expire, in both interactive and headless -p mode
+# (verified on-box, 2.1.207) — so bclaude sessions have no length limit and
+# nothing is ever seeded by hand. The hook accepts the helper's flat
+# credential_process-shaped output directly. The old awsAuthRefresh key from
+# the v2 design is removed; the merge stays additive so unrelated managed
+# settings survive. The dev's personal ~/.claude/settings.json is still
+# never touched.
+MANAGED_SETTINGS="${DEVBOX_CLAUDE_MANAGED_SETTINGS:-/etc/claude-code/managed-settings.json}"
+install -d -m 0755 "$(dirname "$MANAGED_SETTINGS")"
+desired_ms="$(mktemp)"
+if [ -f "$MANAGED_SETTINGS" ]; then
+  jq '. + {awsCredentialExport: "/usr/local/bin/devbox-aws-creds"} | del(.awsAuthRefresh)' "$MANAGED_SETTINGS" > "$desired_ms"
+else
+  jq -n '{awsCredentialExport: "/usr/local/bin/devbox-aws-creds"}' > "$desired_ms"
+fi
+if [ ! -f "$MANAGED_SETTINGS" ] || ! cmp -s "$desired_ms" "$MANAGED_SETTINGS"; then
+  install -m 0644 "$desired_ms" "$MANAGED_SETTINGS"
+fi
+rm -f "$desired_ms"
+
+# ----- 2. [profile devbox-bedrock] in ~/.aws/config -----
+aws_config="$DEV_HOME/.aws/config"
+install -d -m 0755 "$DEV_HOME/.aws"
+chown "$dev_owner:$dev_owner" "$DEV_HOME/.aws" 2>/dev/null || true
+touch "$aws_config"
+
+profile_block="$(printf '[profile devbox-bedrock]\nregion = %s\ncredential_process = /usr/local/bin/devbox-aws-creds\n' "$region")"
+tmp_cfg="$(mktemp)"
+# Strip any prior managed profile section (from '[profile devbox-bedrock]'
+# up to the next section header), keep everything else untouched.
+awk '
+  /^\[profile devbox-bedrock\]$/ { skip = 1; next }
+  /^\[/ && skip { skip = 0 }
+  !skip { print }
+' "$aws_config" > "$tmp_cfg"
+# Trim trailing blank lines, then append the managed profile.
+printf '%s\n' "$(cat "$tmp_cfg")" > "$tmp_cfg" 2>/dev/null || true
+{ cat "$tmp_cfg"; printf '\n%s' "$profile_block"; } > "$tmp_cfg.new"
+if ! cmp -s "$tmp_cfg.new" "$aws_config"; then
+  install_as_dev "$aws_config" 0644 "$tmp_cfg.new"
+fi
+rm -f "$tmp_cfg" "$tmp_cfg.new"
+
+# ----- 2b. seeded, user-editable block in ~/.codex/config.toml -----
+# Plain codex defaults to Bedrock, but the block belongs to the dev after
+# seeding. The "# devbox-render:" line records the sha256 of the body this
+# concern last wrote: while the body still hashes to it the block is
+# machine-state and fleet config updates re-render it IN PLACE; the moment
+# a dev edits anything inside, the hash stops matching and converge leaves
+# the whole file alone — switching plain codex back to a personal account
+# is a supported local edit, not a fight with the converge timer. Deleting
+# the whole block re-seeds it (opting out = editing, not deleting). Still
+# PREPENDED and still dotted provider keys: top-level keys appended after
+# a user [table] would join that table, and a table of ours could capture
+# user keys below the block.
+CODEX_MARK_START="# >>> devbox codex >>> (seeded by devbox-bedrock-config; yours to edit)"
+CODEX_MARK_END="# <<< devbox codex <<<"
+if jq -e '.bedrock.codex_config | length > 0' "$MANIFEST" >/dev/null 2>&1; then
+  install -d -m 0755 "$DEV_HOME/.codex"
+  chown "$dev_owner:$dev_owner" "$DEV_HOME/.codex" 2>/dev/null || true
+  codex_cfg="$DEV_HOME/.codex/config.toml"
+  touch "$codex_cfg"
+  codex_body="$(
+    printf '# To default codex to your personal account instead: set\n'
+    printf '# model_provider = "openai" and drop the model pins below —\n'
+    printf '# converge respects any edit you make inside this block.\n'
+    printf 'model_provider = "amazon-bedrock"\n'
+    jq -r '.bedrock.codex_config | to_entries | sort_by(.key) | .[] | "\(.key) = \"\(.value)\""' "$MANIFEST"
+    printf 'model_providers.amazon-bedrock.aws.profile = "devbox-bedrock"\n'
+    printf 'model_providers.amazon-bedrock.aws.region = "%s"' "$region"
+  )"
+  codex_hash="$(printf '%s\n' "$codex_body" | sha256sum | cut -d' ' -f1)"
+  codex_block="$(printf '%s\n# devbox-render: %s\n%s\n%s' \
+    "$CODEX_MARK_START" "$codex_hash" "$codex_body" "$CODEX_MARK_END")"
+
+  if ! grep -qF "$CODEX_MARK_START" "$codex_cfg"; then
+    # No current block: seed it (prepended). The awk also strips the
+    # short-lived first ship of this block, which reused the bedrock
+    # markers and was unconditionally machine-managed.
+    tmp_codex="$(mktemp)"
+    awk -v start="$MARK_START" -v end="$MARK_END" '
+      $0 == start { skip = 1; next }
+      $0 == end { skip = 0; next }
+      !skip { print }
+    ' "$codex_cfg" > "$tmp_codex"
+    { printf '%s\n' "$codex_block"; cat "$tmp_codex"; } > "$tmp_codex.new"
+    if ! cmp -s "$tmp_codex.new" "$codex_cfg"; then
+      install_as_dev "$codex_cfg" 0644 "$tmp_codex.new"
+    fi
+    rm -f "$tmp_codex" "$tmp_codex.new"
+  else
+    current_body="$(awk -v start="$CODEX_MARK_START" -v end="$CODEX_MARK_END" \
+      '$0 == start { f = 1; next } $0 == end { f = 0 } f' "$codex_cfg" \
+      | grep -v '^# devbox-render: ' || true)"
+    recorded_hash="$(awk -v start="$CODEX_MARK_START" -v end="$CODEX_MARK_END" \
+      '$0 == start { f = 1; next } $0 == end { f = 0 } f' "$codex_cfg" \
+      | sed -n 's/^# devbox-render: //p' | head -1)"
+    current_hash="$(printf '%s\n' "$current_body" | sha256sum | cut -d' ' -f1)"
+    if [ "$current_hash" = "$recorded_hash" ]; then
+      # Untouched machine block: re-render IN PLACE so user content above
+      # or below keeps its position. ENVIRON avoids awk -v escape mangling
+      # of the multi-line replacement.
+      tmp_codex="$(mktemp)"
+      CODEX_BLOCK_REPL="$codex_block" awk \
+        -v start="$CODEX_MARK_START" -v end="$CODEX_MARK_END" '
+        $0 == start { print ENVIRON["CODEX_BLOCK_REPL"]; skip = 1; next }
+        $0 == end { skip = 0; next }
+        !skip { print }
+      ' "$codex_cfg" > "$tmp_codex"
+      if ! cmp -s "$tmp_codex" "$codex_cfg"; then
+        install_as_dev "$codex_cfg" 0644 "$tmp_codex"
+      fi
+      rm -f "$tmp_codex"
+    fi
+    # Hash mismatch = dev-edited: leave the file entirely alone.
+  fi
+  # v1 leftover: the profile-file variant (codex --profile bedrock).
+  rm -f "$DEV_HOME/.codex/bedrock.config.toml"
+fi
+
+# ----- 3. /usr/local/bin/bclaude + bdcc, and retirement of the bashrc block -----
+# GATED on the claude success marker: publishing a wrapper that points at an
+# unverified binary, while deleting the working shell function, would destroy
+# Bedrock access. devbox-converge dispatches this concern whether or not the
+# toolchain succeeded, so ordering is not a substitute for the gate.
+if [ ! -f "$CLAUDE_SUCCESS_FILE" ]; then
+  echo "devbox-bedrock-config: waiting for a verified Claude Code install; leaving bclaude, ~/.bashrc and paseo config unchanged"
+else
+  settings_json=""
+  if jq -e '.bedrock.available_models | length > 0' "$MANIFEST" >/dev/null 2>&1; then
+    settings_json="$(jq -c '{availableModels: .bedrock.available_models}' "$MANIFEST")"
+  fi
+
+  # Captured into a variable FIRST, separately from the loop that consumes
+  # it: a `done < <(jq ...)` process substitution never surfaces jq's exit
+  # status under `set -e`, so a manifest whose .bedrock.model_env is present
+  # but not an object (`// {}` only covers null/absent) would silently
+  # render a wrapper with no model pins at all instead of failing the
+  # concern. Capturing here makes that jq failure fatal, the same way it was
+  # in the retired code.
+  model_env_tsv="$(jq -r '.bedrock.model_env // {} | to_entries | sort_by(.key)
+                          | .[] | "\(.key)\t\(.value)"' "$MANIFEST")"
+
+  # AWS_PROFILE must NOT appear here: Claude Code prefers a profile over env
+  # credentials and cannot resolve credential_process profiles, so setting it
+  # aborts the whole credential chain even with valid keys injected (verified
+  # on-box, 2.1.207). The same is true of every other credential selector:
+  # the pins below are rendered AFTER the `env -u` flags, so any of them
+  # present in .bedrock.model_env would be re-set on the very command line
+  # that just stripped it -- silently routing Bedrock traffic as the wrong
+  # principal, or aborting the credential chain outright. Enforce it rather
+  # than merely documenting it, and do so before tmp_wrapper is created: an
+  # `exit` inside the `{ ... } > "$tmp_wrapper"` group below would abort
+  # mid-render and could leave a temp file behind.
+  while IFS=$'\t' read -r key _; do
+    [ -n "$key" ] || continue
+    for selector in "${CREDENTIAL_SELECTORS[@]}"; do
+      if [ "$key" = "$selector" ]; then
+        echo "FATAL: .bedrock.model_env may not set credential selector $key" >&2
+        exit 1
+      fi
+    done
+  done <<< "$model_env_tsv"
+
+  tmp_wrapper="$(mktemp)"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# Managed by devbox-bedrock-config. Edits are overwritten.\n'
+    printf 'set -euo pipefail\n'
+    printf 'exec env'
+    for selector in "${CREDENTIAL_SELECTORS[@]}"; do
+      printf ' -u %s' "$selector"
+    done
+    printf ' \\\n'
+    printf '  AWS_REGION=%q \\\n' "$region"
+    # %q per value: no intermediate variable for the pin lines themselves,
+    # no `\`-continuation inside a quoted string, no word-splitting -- the
+    # failure mode where an empty model_env truncated the env and ran
+    # claude without the toggle is gone by construction. The empty-string
+    # case still works here: `<<<` appends a trailing newline, so `read`
+    # sees one empty line and the `[ -n "$key" ]` guard below skips it.
+    while IFS=$'\t' read -r key value; do
+      [ -n "$key" ] || continue
+      printf '  %s=%q \\\n' "$key" "$value"
+    done <<< "$model_env_tsv"
+    printf '  CLAUDE_CODE_USE_BEDROCK=1 \\\n'
+    if [ -n "$settings_json" ]; then
+      printf '  %q --settings %q "$@"\n' "$CLAUDE_BIN" "$settings_json"
+    else
+      printf '  %q "$@"\n' "$CLAUDE_BIN"
+    fi
+  } > "$tmp_wrapper"
+  install -d -m 0755 "$(dirname "$BCLAUDE_BIN")"
+  if [ ! -f "$BCLAUDE_BIN" ] || ! cmp -s "$tmp_wrapper" "$BCLAUDE_BIN"; then
+    install -m 0755 "$tmp_wrapper" "$BCLAUDE_BIN"
+  fi
+  rm -f "$tmp_wrapper"
+
+  # bdcc wraps bclaude rather than duplicating it, so env handling and the
+  # settings JSON stay in exactly one place.
+  tmp_bdcc="$(mktemp)"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# Managed by devbox-bedrock-config. Edits are overwritten.\n'
+    printf 'set -euo pipefail\n'
+    printf 'exec %q --dangerously-skip-permissions "$@"\n' "$BCLAUDE_BIN"
+  } > "$tmp_bdcc"
+  if [ ! -f "$BDCC_BIN" ] || ! cmp -s "$tmp_bdcc" "$BDCC_BIN"; then
+    install -m 0755 "$tmp_bdcc" "$BDCC_BIN"
+  fi
+  rm -f "$tmp_bdcc"
+
+  # Retire the shell functions. This is REQUIRED, not cosmetic: a bash
+  # function shadows PATH lookup, so a surviving block would keep interactive
+  # bclaude bound to the function and leave the wrapper dead. The markers stay
+  # defined -- the codex seeding path still uses them to migrate its own
+  # first-ship block.
+  bashrc="$DEV_HOME/.bashrc"
+  touch "$bashrc"
+  tmp_rc="$(mktemp)"
+  awk -v start="$MARK_START" -v end="$MARK_END" '
+    $0 == start { skip = 1; next }
+    $0 == end { skip = 0; next }
+    !skip { print }
+  ' "$bashrc" > "$tmp_rc"
+  if ! cmp -s "$tmp_rc" "$bashrc"; then
+    install_as_dev "$bashrc" 0644 "$tmp_rc"
+  fi
+  rm -f "$tmp_rc"
+
+  # ----- 4. agents.providers.bclaude in ~/.paseo/config.json -----
+  # Machine-managed: the whole bclaude object is replaced each converge, the
+  # same class as the daemon/cors/features keys ensure_paseo writes. It cannot
+  # live in ensure_paseo, which returns early once its success marker exists.
+  # Guarded on the config file rather than the paseo marker, so a pre-existing
+  # root-owned paseo -- excluded from the install concern but carrying the same
+  # Bedrock config -- gets the provider too.
+  if [ -f "$PASEO_CONFIG_FILE" ] \
+      && jq -e 'type == "object"' "$PASEO_CONFIG_FILE" >/dev/null 2>&1; then
+    # Labels and thinkingOptions are DERIVED from the model id -- still no new
+    # fleet variable. An id that does not parse as an Anthropic Claude Bedrock
+    # id keeps the id verbatim as its label and gets no thinking options, so
+    # unknown shapes degrade to the old rendering instead of breaking.
+    # Ladders mirror Paseo's builtin claude catalog (model-manifest.js):
+    # haiku none, opus/sonnet 5+ and opus 4.7+ xhigh, fable always xhigh --
+    # WITHOUT "ultracode": Bedrock does not support Ultra Code.
+    # An EMPTY available_models omits the key entirely -- writing [] would
+    # replace the inherited list with nothing and blank the picker.
+    models_json="$(jq -c \
+      --arg default "$(jq -r '.bedrock.model_env.ANTHROPIC_MODEL // ""' "$MANIFEST")" '
+        def parsed:
+          capture("^(?:(?<route>global|us|eu|apac)\\.)?anthropic\\.claude-"
+                  + "(?<fam>fable|opus|sonnet|haiku)-(?<maj>[0-9])(?:-(?<min>[0-9]))?"
+                  + "(?:-[0-9]{8})?(?:-v[0-9:]+)?(?:\\[(?<context>1m)\\])?$") // null;
+        def ladder($xhigh):
+          [ {id: "low", label: "Low"},
+            {id: "medium", label: "Medium"},
+            {id: "high", label: "High"} ]
+          + (if $xhigh then [{id: "xhigh", label: "Extra High"}] else [] end)
+          + [ {id: "max", label: "Max"} ];
+        def thinking($m):
+          if $m.fam == "haiku" then null
+          elif $m.fam == "fable" then ladder(true)
+          else ladder(($m.maj | tonumber) >= 5
+                      or (($m.maj | tonumber) == 4 and (($m.min // "0") | tonumber) >= 7))
+          end;
+        def pretty_label($m):
+          ({fable: "Fable", opus: "Opus", sonnet: "Sonnet", haiku: "Haiku"}[$m.fam])
+          + " " + $m.maj
+          + (if $m.min then "." + $m.min else "" end)
+          + (if $m.route and $m.context then " (" + $m.route + ", 1M)"
+             elif $m.route then " (" + $m.route + ")"
+             elif $m.context then " (1M)"
+             else ""
+             end);
+        [ (.bedrock.available_models // [])[]
+          | . as $id | parsed as $m
+          | if $m == null then {id: $id, label: $id}
+            else {id: $id, label: pretty_label($m)}
+                 + (thinking($m) as $t
+                    | if $t == null then {} else {thinkingOptions: $t} end)
+            end ]
+        | map(if .id == $default then . + {isDefault: true} else . end)
+      ' "$MANIFEST")"
+
+    tmp_paseo="$(mktemp "$(dirname "$PASEO_CONFIG_FILE")/.config.json.XXXXXX")"
+    if jq \
+        --argjson models "$models_json" \
+        --arg bin "$BCLAUDE_BIN" '
+          .agents = ((.agents // {}) + {
+            providers: ((.agents.providers // {}) + {
+              bclaude: ({
+                extends: "claude",
+                label: "Claude (Bedrock)",
+                description: "Claude Code on Amazon Bedrock via the shared workload role",
+                command: [$bin]
+              } + (if ($models | length) > 0 then {models: $models} else {} end))
+            })
+          })
+        ' "$PASEO_CONFIG_FILE" > "$tmp_paseo" \
+        && jq -e '
+          .agents.providers.bclaude as $p
+          | ($p | keys
+              - ["extends","label","description","command","env","params","models","additionalModels","disallowedTools","enabled","order"]
+              | length == 0)
+            and $p.extends == "claude"
+            and ($p.label | type == "string")
+            and ($p.command | length == 1)
+        ' "$tmp_paseo" >/dev/null; then
+      # PersistedConfigSchema is .strict(): a stray key aborts the dev's daemon
+      # at startup, so validation runs before the file is moved into place.
+      #
+      # Not install_as_dev here: `install -m … SRC DEST` opens DEST O_TRUNC
+      # and writes in place, so a long-lived Paseo daemon reading this file
+      # could observe a torn write mid-read. tmp_paseo was created in the
+      # same directory as PASEO_CONFIG_FILE (the mktemp above), so this mv is
+      # a same-filesystem rename -- atomic, and unable to tear.
+      if ! cmp -s "$tmp_paseo" "$PASEO_CONFIG_FILE"; then
+        chown "$dev_owner:$dev_owner" "$tmp_paseo" 2>/dev/null || true
+        chmod 0600 "$tmp_paseo"
+        mv -f "$tmp_paseo" "$PASEO_CONFIG_FILE"
+      fi
+    else
+      echo "devbox-bedrock-config: paseo provider render failed validation; config left unchanged" >&2
+    fi
+    rm -f "$tmp_paseo"
+  fi
+fi
+
+echo "devbox-bedrock-config: converged (role $role_arn, region $region)"

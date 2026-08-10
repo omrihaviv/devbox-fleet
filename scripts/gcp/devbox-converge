@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# GCP devbox converge — manifest-driven pull.
+# Fetches the fleet manifest from GCS (or a pinned candidate via
+# --manifest-sha), self-updates the runtime scripts by checksum, exports the
+# manifest's fleet env + per-machine metadata overrides, and dispatches the
+# concern scripts. Scheduled by devbox-converge.timer; triggered manually by
+# scripts/gcp/sync-converge.sh over Tailscale SSH.
+set -euo pipefail
+
+STATE_DIR="${DEVBOX_RUNTIME_STATE_DIR:-/var/lib/devbox-runtime}"
+INSTALL_DIR="${DEVBOX_INSTALL_DIR:-/usr/local/bin}"
+BUCKET="${DEVBOX_RUNTIME_BUCKET:-$(cat /etc/devbox/runtime-bucket 2>/dev/null || true)}"
+GCS_URL="${DEVBOX_GCS_URL:-https://storage.googleapis.com}"
+METADATA_URL="${DEVBOX_METADATA_URL:-http://metadata.google.internal/computeMetadata/v1}"
+MANIFEST_SHA="${DEVBOX_MANIFEST_SHA:-}"
+ALLOW_TAILSCALE_UPGRADE="${DEVBOX_ALLOW_TAILSCALE_UPGRADE:-0}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest-sha) MANIFEST_SHA="$2"; shift 2 ;;
+    --allow-tailscale-upgrade) ALLOW_TAILSCALE_UPGRADE=1; shift ;;
+    *) echo "FATAL: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ "${DEVBOX_SKIP_ROOT_CHECK:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  echo "FATAL: run as root" >&2
+  exit 1
+fi
+
+if [ -z "$BUCKET" ]; then
+  echo "FATAL: runtime bucket unknown (set DEVBOX_RUNTIME_BUCKET or /etc/devbox/runtime-bucket)" >&2
+  exit 1
+fi
+
+install -d -m 0755 "$STATE_DIR"
+
+exec 9>"$STATE_DIR/converge.lock"
+if ! flock -n 9; then
+  echo "devbox-converge: another converge run is active; skipping"
+  exit 0
+fi
+
+access_token() {
+  curl -fsS -H 'Metadata-Flavor: Google' \
+    "$METADATA_URL/instance/service-accounts/default/token" \
+    | jq -r .access_token
+}
+
+# Fetch a GCS object to a local path via the XML API + bearer token.
+# No gcloud/aws CLI in this path — design global constraint.
+gcs_fetch() {
+  local object="$1" dest="$2"
+  curl -fsSL -H "Authorization: Bearer $(access_token)" \
+    -o "$dest" "$GCS_URL/$BUCKET/$object"
+}
+
+instance_attr() {
+  local name="$1"
+  curl -fsS -H 'Metadata-Flavor: Google' \
+    "$METADATA_URL/instance/attributes/$name" 2>/dev/null || true
+}
+
+# ----- 1. Fetch manifest (pointer, or content-addressed candidate) -----
+manifest_tmp="$(mktemp)"
+if [ -n "$MANIFEST_SHA" ]; then
+  gcs_fetch "runtime/manifest/$MANIFEST_SHA.json" "$manifest_tmp"
+  # Candidates are content-addressed: the fetch self-verifies.
+  echo "$MANIFEST_SHA  $manifest_tmp" | sha256sum -c - >/dev/null \
+    || { echo "FATAL: candidate manifest content does not match its sha" >&2; exit 1; }
+else
+  gcs_fetch "runtime/manifest.json" "$manifest_tmp"
+  MANIFEST_SHA="$(sha256sum "$manifest_tmp" | awk '{print $1}')"
+fi
+
+jq -e '.schema == 1' "$manifest_tmp" >/dev/null \
+  || { echo "FATAL: manifest schema != 1" >&2; exit 1; }
+
+# ----- 2. Self-update runtime scripts by checksum -----
+# devbox-converge itself may be updated here too: the new file lands on disk
+# but THIS run keeps executing the old code — the next run uses the new one.
+fetch_failures=0
+while IFS=$'\t' read -r name key sha; do
+  installed="$INSTALL_DIR/$name"
+  if [ -f "$installed" ] && [ "$(sha256sum "$installed" | awk '{print $1}')" = "$sha" ]; then
+    continue
+  fi
+  tmp="$(mktemp)"
+  if ! gcs_fetch "$key" "$tmp"; then
+    echo "ERROR: could not fetch $name from $key" >&2
+    rm -f "$tmp"; fetch_failures=$((fetch_failures + 1)); continue
+  fi
+  if ! echo "$sha  $tmp" | sha256sum -c - >/dev/null; then
+    echo "ERROR: checksum mismatch for $name; refusing to install unverified content" >&2
+    rm -f "$tmp"; fetch_failures=$((fetch_failures + 1)); continue
+  fi
+  install -o root -g root -m 0755 "$tmp" "$installed" 2>/dev/null \
+    || install -m 0755 "$tmp" "$installed"
+  rm -f "$tmp"
+  echo "devbox-converge: installed $name ($sha)"
+done < <(jq -r '.scripts | to_entries[] | [.key, .value.key, .value.sha256] | @tsv' "$manifest_tmp")
+
+# ----- 3. Export fleet env from manifest + per-machine metadata overrides -----
+# JSON's TSV formatter backslash-escapes field contents; `read -r` correctly
+# refuses to unescape them, so a regex would otherwise be silently changed.
+# NUL framing is lossless for environment strings (which cannot contain NUL).
+env_records_tmp="$(mktemp)"
+if ! jq --raw-output0 \
+  '(.env // {} | to_entries[]) | .key, (.value | tostring)' \
+  "$manifest_tmp" > "$env_records_tmp"; then
+  rm -f "$env_records_tmp"
+  echo "FATAL: manifest env is invalid or contains a NUL byte" >&2
+  exit 1
+fi
+while IFS= read -r -d '' k; do
+  if ! IFS= read -r -d '' v; then
+    rm -f "$env_records_tmp"
+    echo "FATAL: truncated manifest env key/value record" >&2
+    exit 1
+  fi
+  if ! export "$k=$v"; then
+    rm -f "$env_records_tmp"
+    echo "FATAL: invalid manifest env key: $k" >&2
+    exit 1
+  fi
+done < "$env_records_tmp"
+rm -f "$env_records_tmp"
+
+swap_override="$(instance_attr devbox-swap-gib)"
+if [ -n "$swap_override" ]; then
+  export DEVBOX_SWAP_SIZE_GIB="$swap_override"
+fi
+export DEVBOX_ALLOW_TAILSCALE_UPGRADE="$ALLOW_TAILSCALE_UPGRADE"
+
+# Persist for concerns that read it after this run (devbox-bedrock-config).
+install -m 0644 "$manifest_tmp" "$STATE_DIR/manifest.json"
+
+# ----- 4. Dispatch concerns (independently; continue past failures) -----
+failures=()
+run_concern() {
+  local label="$1" path="$INSTALL_DIR/$2"
+  if [ ! -x "$path" ]; then
+    echo "WARN: $label script not executable at $path; skipping" >&2
+    return 0
+  fi
+  echo "=== devbox-converge: $label ==="
+  local rc
+  set +e; "$path"; rc=$?; set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "ERROR: $label failed with exit $rc" >&2
+    failures+=("$label")
+  fi
+}
+
+if [ "${DEVBOX_SKIP_CONCERNS:-0}" != 1 ]; then
+  run_concern "memory" "devbox-memory-hotfix"
+  run_concern "toolchain" "devbox-toolchain"
+  run_concern "observability" "devbox-observability"
+  run_concern "bedrock-config" "devbox-bedrock-config"
+fi
+
+rm -f "$manifest_tmp"
+
+if [ "$fetch_failures" -ne 0 ] || [ "${#failures[@]}" -ne 0 ]; then
+  printf 'devbox-converge incomplete;' >&2
+  [ "$fetch_failures" -ne 0 ] && printf ' fetch failures: %d;' "$fetch_failures" >&2
+  [ "${#failures[@]}" -ne 0 ] && printf ' failed concerns:%s' "$(printf ' %s' "${failures[@]}")" >&2
+  printf '\n' >&2
+  exit 1
+fi
+
+date -u --iso-8601=seconds > "$STATE_DIR/converge.last-success"
+# Heartbeat: journald → Ops Agent → Cloud Logging → log-based metric →
+# 23h absence alert. The exact token is load-bearing.
+logger -t devbox-converge "devbox-converge-success manifest_sha=$MANIFEST_SHA"
+echo "devbox-converge complete (manifest $MANIFEST_SHA)"

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Converge the Google Ops Agent: pinned package + config with host metrics AND
+# per-process metrics (the admin-investigation requirement). Logging keeps the
+# agent's defaults (syslog/journald → Cloud Logging), which carries the
+# devbox-converge heartbeat line to the log-based metric.
+set -euo pipefail
+
+OPS_AGENT_VERSION="${DEVBOX_OPS_AGENT_VERSION:-}"
+CONFIG="${DEVBOX_OPS_AGENT_CONFIG:-/etc/google-cloud-ops-agent/config.yaml}"
+STATE_DIR="${DEVBOX_RUNTIME_STATE_DIR:-/var/lib/devbox-runtime}"
+VERSION_MARKER="$STATE_DIR/ops-agent.version"
+
+if [ "${DEVBOX_SKIP_ROOT_CHECK:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  echo "FATAL: run as root" >&2
+  exit 1
+fi
+
+if [ -z "$OPS_AGENT_VERSION" ]; then
+  echo "FATAL: DEVBOX_OPS_AGENT_VERSION must be set (manifest env)" >&2
+  exit 1
+fi
+
+install -d -m 0755 "$STATE_DIR"
+export DEBIAN_FRONTEND=noninteractive
+
+package_changed=false
+if [ "${DEVBOX_SKIP_APT:-0}" != 1 ]; then
+  if [ ! -f "$VERSION_MARKER" ] || [ "$(cat "$VERSION_MARKER")" != "$OPS_AGENT_VERSION" ] \
+     || ! dpkg-query -W google-cloud-ops-agent >/dev/null 2>&1; then
+    if [ ! -f /etc/apt/sources.list.d/google-cloud-ops-agent.list ]; then
+      curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+        | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+      echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt google-cloud-ops-agent-noble-all main" \
+        > /etc/apt/sources.list.d/google-cloud-ops-agent.list
+    fi
+    apt-get update
+    apt-get install -y --allow-downgrades "google-cloud-ops-agent=${OPS_AGENT_VERSION}*"
+    printf '%s\n' "$OPS_AGENT_VERSION" > "$VERSION_MARKER"
+    package_changed=true
+  else
+    echo "ops-agent package: already converged"
+  fi
+else
+  # Test seam: emulate package convergence bookkeeping only.
+  if [ ! -f "$VERSION_MARKER" ] || [ "$(cat "$VERSION_MARKER")" != "$OPS_AGENT_VERSION" ]; then
+    printf '%s\n' "$OPS_AGENT_VERSION" > "$VERSION_MARKER"
+    package_changed=true
+  else
+    echo "ops-agent package: already converged"
+  fi
+fi
+
+desired="$(mktemp)"
+cat > "$desired" <<'EOF'
+# Managed by devbox-observability (converge bundle) — do not edit.
+metrics:
+  receivers:
+    # hostmetrics also ships per-process metrics (agent.googleapis.com/processes/*);
+    # the Ops Agent has no separate "processes" receiver type — configuring one
+    # fails config validation and kills the agent unit.
+    hostmetrics:
+      type: hostmetrics
+      collection_interval: 60s
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: [hostmetrics]
+EOF
+
+config_changed=false
+install -d -m 0755 "$(dirname "$CONFIG")"
+if [ ! -f "$CONFIG" ] || ! cmp -s "$desired" "$CONFIG"; then
+  install -m 0644 "$desired" "$CONFIG"
+  config_changed=true
+else
+  echo "ops-agent config: already converged"
+fi
+rm -f "$desired"
+
+if [ "$package_changed" = true ] || [ "$config_changed" = true ]; then
+  echo "ops-agent: restart-needed (package_changed=$package_changed config_changed=$config_changed)"
+  if [ "${DEVBOX_SKIP_SYSTEMCTL:-0}" != 1 ]; then
+    systemctl enable google-cloud-ops-agent
+    systemctl restart google-cloud-ops-agent
+  fi
+else
+  echo "ops-agent: already converged; no restart"
+fi

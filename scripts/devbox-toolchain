@@ -1,0 +1,1251 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APT_GET=(apt-get -o DPkg::Lock::Timeout=300)
+
+DEV_USER="${DEVBOX_DEV_USER:-dev}"
+DEV_HOME="${DEVBOX_DEV_HOME:-/home/dev}"
+APT_KEYRING_DIR="${DEVBOX_APT_KEYRING_DIR:-/etc/apt/keyrings}"
+APT_SOURCE_DIR="${DEVBOX_APT_SOURCE_DIR:-/etc/apt/sources.list.d}"
+SHARE_KEYRING_DIR="${DEVBOX_SHARE_KEYRING_DIR:-/usr/share/keyrings}"
+NPM_GLOBAL_DIR="${DEVBOX_NPM_GLOBAL_DIR:-/usr/lib/node_modules}"
+NODE_BIN="${DEVBOX_NODE_BIN:-/usr/bin/node}"
+NPM_BIN="${DEVBOX_NPM_BIN:-/usr/bin/npm}"
+TAILSCALE_BIN="${DEVBOX_TAILSCALE_BIN:-/usr/bin/tailscale}"
+CHROME_BIN="${DEVBOX_CHROME_BIN:-/usr/bin/google-chrome-stable}"
+ALLOW_TAILSCALE_UPGRADE="${DEVBOX_ALLOW_TAILSCALE_UPGRADE:-0}"
+DATA_MOUNT="${DEVBOX_DATA_MOUNT:-/data}"
+CONTAINERD_STATE_DIR="${DEVBOX_CONTAINERD_STATE_DIR:-/var/lib/containerd}"
+FSTAB_FILE="${DEVBOX_FSTAB:-/etc/fstab}"
+GCP_RUNTIME_BUCKET_FILE="${DEVBOX_GCP_RUNTIME_BUCKET_FILE:-/etc/devbox/runtime-bucket}"
+BOOTSTRAP_COMPLETE_FILE="${DEVBOX_BOOTSTRAP_COMPLETE_FILE:-/var/lib/devbox-bootstrap/complete}"
+CODEX_REQUIRED_FILE="${DEVBOX_CODEX_REQUIRED_FILE:-/var/lib/devbox-runtime/codex-cli-required}"
+CODEX_SUCCESS_FILE="${DEVBOX_CODEX_SUCCESS_FILE:-/var/lib/devbox-runtime/codex-cli-installed}"
+CODEX_INSTALLER_URL="${DEVBOX_CODEX_INSTALLER_URL:-https://chatgpt.com/codex/install.sh}"
+CODEX_INSTALL_DIR="${DEVBOX_CODEX_INSTALL_DIR:-$DEV_HOME/.local/bin}"
+CODEX_BIN="${DEVBOX_CODEX_BIN:-$CODEX_INSTALL_DIR/codex}"
+PASEO_REQUIRED_FILE="${DEVBOX_PASEO_REQUIRED_FILE:-/var/lib/devbox-runtime/paseo-required}"
+PASEO_SUCCESS_FILE="${DEVBOX_PASEO_SUCCESS_FILE:-/var/lib/devbox-runtime/paseo-installed}"
+PASEO_NPM_PREFIX="${DEVBOX_PASEO_NPM_PREFIX:-$DEV_HOME/.local/share/paseo/npm}"
+PASEO_PACKAGE_DIR="${DEVBOX_PASEO_PACKAGE_DIR:-$PASEO_NPM_PREFIX/lib/node_modules/@getpaseo/cli}"
+PASEO_USER_BIN="${DEVBOX_PASEO_USER_BIN:-$PASEO_NPM_PREFIX/bin/paseo}"
+PASEO_BIN="${DEVBOX_PASEO_BIN:-$DEV_HOME/.local/bin/paseo}"
+PASEO_SYSTEM_BIN="${DEVBOX_PASEO_SYSTEM_BIN:-/usr/local/bin/paseo}"
+PASEO_LEGACY_BIN="${DEVBOX_PASEO_LEGACY_BIN:-/usr/bin/paseo}"
+PASEO_CONFIG_DIR="${DEVBOX_PASEO_CONFIG_DIR:-$DEV_HOME/.paseo}"
+PASEO_CONFIG_FILE="${DEVBOX_PASEO_CONFIG_FILE:-$PASEO_CONFIG_DIR/config.json}"
+PASEO_DAEMON_RUNNER="${DEVBOX_PASEO_DAEMON_RUNNER:-/usr/local/bin/devbox-paseo-daemon}"
+PASEO_DAEMON_SERVICE_FILE="${DEVBOX_PASEO_DAEMON_SERVICE_FILE:-/etc/systemd/system/paseo.service}"
+VSCODE_REQUIRED_FILE="${DEVBOX_VSCODE_REQUIRED_FILE:-/var/lib/devbox-runtime/vscode-required}"
+VSCODE_SUCCESS_FILE="${DEVBOX_VSCODE_SUCCESS_FILE:-/var/lib/devbox-runtime/vscode-installed}"
+VSCODE_BIN="${DEVBOX_VSCODE_BIN:-/usr/bin/code}"
+VSCODE_LAUNCHER="${DEVBOX_VSCODE_LAUNCHER:-/usr/local/bin/devbox-vscode}"
+VSCODE_VERSION="${DEVBOX_VSCODE_VERSION:-latest}"
+CLAUDE_BIN="${DEVBOX_CLAUDE_BIN:-$DEV_HOME/.local/bin/claude}"
+CLAUDE_INSTALLER_URL="${DEVBOX_CLAUDE_INSTALLER_URL:-https://claude.ai/install.sh}"
+CLAUDE_INSTALL_TARGET="${DEVBOX_CLAUDE_INSTALL_TARGET:-latest}"
+CLAUDE_REQUIRED_FILE="${DEVBOX_CLAUDE_REQUIRED_FILE:-/var/lib/devbox-runtime/claude-code-required}"
+CLAUDE_SUCCESS_FILE="${DEVBOX_CLAUDE_SUCCESS_FILE:-/var/lib/devbox-runtime/claude-code-installed}"
+CLAUDE_OLD_SYSTEM_BIN="${DEVBOX_CLAUDE_OLD_SYSTEM_BIN:-/usr/bin/claude}"
+CLAUDE_OLD_NPM_DIR="${DEVBOX_CLAUDE_OLD_NPM_DIR:-$NPM_GLOBAL_DIR/@anthropic-ai/claude-code}"
+CLAUDE_NVM_ROOT="${DEVBOX_CLAUDE_NVM_ROOT:-$DEV_HOME/.nvm/versions/node}"
+AGENT_PLUGINS_REQUIRED_FILE="${DEVBOX_AGENT_PLUGINS_REQUIRED_FILE:-/var/lib/devbox-runtime/agent-plugins-required}"
+AGENT_PLUGINS_SUCCESS_FILE="${DEVBOX_AGENT_PLUGINS_SUCCESS_FILE:-/var/lib/devbox-runtime/agent-plugins-installed}"
+TMUX_PLUGINS_DIR="${DEVBOX_TMUX_PLUGINS_DIR:-/opt/tmux-plugins}"
+TMUX_CONF_FILE="${DEVBOX_TMUX_CONF_FILE:-$DEV_HOME/.tmux.conf}"
+TMUX_BIN="${DEVBOX_TMUX_BIN:-/usr/bin/tmux}"
+TMUX_SOCKET="${DEVBOX_TMUX_SOCKET:-}" # default: /tmp/tmux-<dev uid>/default, resolved at use
+
+apt_updated=false
+apt_needs_update=false
+failures=()
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "FATAL: run as root" >&2
+  exit 1
+fi
+
+require_env() {
+  local missing=()
+  local name
+
+  for name in \
+    DEVBOX_TAILSCALE_VERSION \
+    DEVBOX_DOCKER_CE_VERSION \
+    DEVBOX_GH_VERSION \
+    DEVBOX_SYSTEM_NODE_VERSION \
+    DEVBOX_NVM_VERSION \
+    DEVBOX_NVM_INSTALL_SHA256 \
+    DEVBOX_NODE_VERSION \
+    DEVBOX_GOOGLE_CHROME_VERSION \
+    DEVBOX_CHROME_DEVTOOLS_MCP_VERSION \
+    DEVBOX_AWS_CLI_VERSION \
+    DEVBOX_AWS_CLI_INSTALL_SHA256 \
+    DEVBOX_TMUX_RESURRECT_COMMIT \
+    DEVBOX_TMUX_CONTINUUM_COMMIT; do
+    if [ -z "${!name:-}" ]; then
+      missing+=("$name")
+    fi
+  done
+
+  if [ "${#missing[@]}" -ne 0 ]; then
+    printf 'FATAL: missing required toolchain environment variables:' >&2
+    printf ' %s' "${missing[@]}" >&2
+    printf '\n' >&2
+    exit 1
+  fi
+}
+
+require_env
+
+install_if_changed() {
+  local src="$1"
+  local dest="$2"
+  local mode="$3"
+
+  install -d -m 0755 "$(dirname "$dest")"
+  if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+    return 1
+  fi
+
+  install -m "$mode" "$src" "$dest"
+  return 0
+}
+
+install_apt_file_if_changed() {
+  local src="$1"
+  local dest="$2"
+  local mode="$3"
+
+  if install_if_changed "$src" "$dest" "$mode"; then
+    apt_needs_update=true
+  fi
+}
+
+write_apt_source() {
+  local dest="$1"
+  local content="$2"
+  local tmp
+
+  tmp="$(mktemp)"
+  printf '%s\n' "$content" > "$tmp"
+  install_apt_file_if_changed "$tmp" "$dest" 0644
+  rm -f "$tmp"
+}
+
+download_keyring() {
+  local url="$1"
+  local dest="$2"
+  local tmp
+
+  tmp="$(mktemp)"
+  curl -fsSL "$url" -o "$tmp"
+  install_apt_file_if_changed "$tmp" "$dest" 0644
+  rm -f "$tmp"
+}
+
+download_dearmored_keyring() {
+  local url="$1"
+  local dest="$2"
+  local tmpdir
+
+  tmpdir="$(mktemp -d)"
+  curl -fsSL "$url" -o "$tmpdir/key"
+  gpg --batch --yes --dearmor -o "$tmpdir/key.gpg" "$tmpdir/key"
+  install_apt_file_if_changed "$tmpdir/key.gpg" "$dest" 0644
+  rm -rf "$tmpdir"
+}
+
+apt_update_if_needed() {
+  if [ "$apt_needs_update" = true ] || [ "$apt_updated" = false ]; then
+    "${APT_GET[@]}" update
+    apt_updated=true
+    apt_needs_update=false
+  fi
+}
+
+dpkg_version() {
+  local package="$1"
+  dpkg-query -W -f='${Version}' "$package" 2>/dev/null || true
+}
+
+ensure_apt_package_version() {
+  local package="$1"
+  local desired="$2"
+  local installed=""
+
+  installed="$(dpkg_version "$package")"
+
+  # "latest" floats the package to the newest version in its (GPG-signed) repo
+  # instead of pinning an exact version. Used for tools whose upstream apt repos
+  # evict old releases (gh, google-chrome) or churn patch versions (docker-ce),
+  # where a frozen pin eventually fails a fresh install with "Version not found".
+  # apt still verifies the package signature against the repo keyring, so this
+  # trades exact-version reproducibility for never-goes-stale, not integrity.
+  if [ "$desired" = "latest" ]; then
+    apt_update_if_needed
+    local candidate
+    candidate="$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2}')"
+    if [ -n "$installed" ] && [ "$installed" = "$candidate" ]; then
+      echo "$package: already latest ($installed)"
+      return 0
+    fi
+    echo "$package: installing latest (candidate ${candidate:-unknown}, currently ${installed:-missing})"
+    "${APT_GET[@]}" install -y "$package"
+    return 0
+  fi
+
+  if [ "$installed" = "$desired" ]; then
+    echo "$package: already $desired"
+    return 0
+  fi
+
+  echo "$package: installing $desired (currently ${installed:-missing})"
+  apt_update_if_needed
+  "${APT_GET[@]}" install -y "${package}=${desired}"
+}
+
+ensure_apt_package() {
+  local package="$1"
+
+  if dpkg-query -W "$package" >/dev/null 2>&1; then
+    echo "$package: already installed"
+    return 0
+  fi
+
+  echo "$package: installing"
+  apt_update_if_needed
+  "${APT_GET[@]}" install -y "$package"
+}
+
+ensure_base_tools() {
+  local package
+
+  for package in git make build-essential jq unzip mosh tmux htop ripgrep fd-find; do
+    ensure_apt_package "$package"
+  done
+}
+
+ensure_tailscale_repo() {
+  download_keyring \
+    https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+    "$SHARE_KEYRING_DIR/tailscale-archive-keyring.gpg"
+  download_keyring \
+    https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+    "$APT_SOURCE_DIR/tailscale.list"
+}
+
+ensure_tailscale_package() {
+  local installed
+
+  ensure_tailscale_repo
+  installed="$(dpkg_version tailscale)"
+
+  if [ "$installed" = "$DEVBOX_TAILSCALE_VERSION" ]; then
+    echo "tailscale: already $DEVBOX_TAILSCALE_VERSION"
+  elif [ -n "$installed" ] && [ "$ALLOW_TAILSCALE_UPGRADE" != "1" ]; then
+    echo "tailscale: installed $installed, desired $DEVBOX_TAILSCALE_VERSION; skipping upgrade without DEVBOX_ALLOW_TAILSCALE_UPGRADE=1"
+    return 0
+  else
+    ensure_apt_package_version tailscale "$DEVBOX_TAILSCALE_VERSION"
+  fi
+
+  systemctl enable --now tailscaled
+}
+
+ensure_gh() {
+  download_keyring \
+    https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    "$SHARE_KEYRING_DIR/githubcli-archive-keyring.gpg"
+  write_apt_source \
+    "$APT_SOURCE_DIR/github-cli.list" \
+    "deb [arch=$(dpkg --print-architecture) signed-by=$SHARE_KEYRING_DIR/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main"
+
+  ensure_apt_package_version gh "$DEVBOX_GH_VERSION"
+}
+
+# Docker Engine >= 29 defaults to the containerd image store, so image layers
+# live in /var/lib/containerd, not /var/lib/docker. Boxes built before the
+# containerd bind mount existed have that directory on the ephemeral root
+# volume: images vanish on rebuild, can fill the root disk, and sit outside
+# persistent-data backups. This migrates such boxes in place. The old
+# root-volume image store is DISCARDED, not copied — layers are
+# re-pullable and copying would double root-disk pressure; devs re-pull once.
+ensure_containerd_data_mount() {
+  local src="$DATA_MOUNT/containerd"
+  local entry="$src $CONTAINERD_STATE_DIR none bind 0 0"
+
+  if ! mountpoint -q "$DATA_MOUNT"; then
+    echo "FATAL: $DATA_MOUNT is not a mountpoint; refusing to place containerd state on the root volume" >&2
+    return 1
+  fi
+
+  if ! mountpoint -q "$CONTAINERD_STATE_DIR"; then
+    echo "containerd: migrating $CONTAINERD_STATE_DIR onto $src (old root-volume image store is discarded)"
+    systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
+    mkdir -p "$src" "$CONTAINERD_STATE_DIR"
+    chown root:root "$src" "$CONTAINERD_STATE_DIR"
+    chmod 0700 "$src" "$CONTAINERD_STATE_DIR"
+    find "$CONTAINERD_STATE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    mount --bind "$src" "$CONTAINERD_STATE_DIR"
+    systemctl start containerd.service docker.service 2>/dev/null || true
+  else
+    echo "containerd: $CONTAINERD_STATE_DIR already a mountpoint"
+  fi
+
+  grep -qF "$entry" "$FSTAB_FILE" || echo "$entry" >> "$FSTAB_FILE"
+}
+
+ensure_docker() {
+  ensure_containerd_data_mount
+
+  download_dearmored_keyring \
+    https://download.docker.com/linux/ubuntu/gpg \
+    "$APT_KEYRING_DIR/docker.gpg"
+  write_apt_source \
+    "$APT_SOURCE_DIR/docker.list" \
+    "deb [arch=$(dpkg --print-architecture) signed-by=$APT_KEYRING_DIR/docker.gpg] https://download.docker.com/linux/ubuntu noble stable"
+
+  ensure_apt_package_version docker-ce "$DEVBOX_DOCKER_CE_VERSION"
+  ensure_apt_package_version docker-ce-cli "$DEVBOX_DOCKER_CE_VERSION"
+  ensure_apt_package containerd.io
+  ensure_apt_package docker-compose-plugin
+
+  usermod -aG docker "$DEV_USER"
+  systemctl enable --now docker
+}
+
+ensure_system_node() {
+  local node_major
+
+  download_dearmored_keyring \
+    https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    "$APT_KEYRING_DIR/nodesource.gpg"
+
+  node_major="${DEVBOX_SYSTEM_NODE_VERSION%%.*}"
+  write_apt_source \
+    "$APT_SOURCE_DIR/nodesource.list" \
+    "deb [signed-by=$APT_KEYRING_DIR/nodesource.gpg] https://deb.nodesource.com/node_${node_major}.x nodistro main"
+
+  ensure_apt_package_version nodejs "$DEVBOX_SYSTEM_NODE_VERSION"
+
+  [ -x "$NODE_BIN" ] || { echo "FATAL: $NODE_BIN missing after NodeSource install" >&2; exit 1; }
+  [ -x "$NPM_BIN" ] || { echo "FATAL: $NPM_BIN missing after NodeSource install" >&2; exit 1; }
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+ensure_nvm_and_dev_node() {
+  local installed_nvm=""
+  local nvm_tmp
+  local quoted_node_version
+
+  if [ -s "$DEV_HOME/.nvm/nvm.sh" ]; then
+    installed_nvm="$(sudo -u "$DEV_USER" -H bash -lc 'source ~/.nvm/nvm.sh && nvm --version' 2>/dev/null || true)"
+  fi
+
+  if [ "$installed_nvm" = "$DEVBOX_NVM_VERSION" ]; then
+    echo "nvm: already $DEVBOX_NVM_VERSION"
+  else
+    nvm_tmp="$(mktemp)"
+    curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/v${DEVBOX_NVM_VERSION}/install.sh" -o "$nvm_tmp"
+    echo "$DEVBOX_NVM_INSTALL_SHA256  $nvm_tmp" | sha256sum -c -
+    cat "$nvm_tmp" | sudo -u "$DEV_USER" -H env NVM_VERSION="$DEVBOX_NVM_VERSION" bash -s
+    rm -f "$nvm_tmp"
+  fi
+
+  quoted_node_version="$(shell_quote "$DEVBOX_NODE_VERSION")"
+  sudo -u "$DEV_USER" -H bash -lc "source ~/.nvm/nvm.sh && nvm install $quoted_node_version && nvm alias default $quoted_node_version"
+}
+
+installed_node_module_version() {
+  local module_dir="$1"
+
+  if [ -f "$module_dir/package.json" ] && [ -x "$NODE_BIN" ]; then
+    "$NODE_BIN" -p "require('${module_dir}/package.json').version" 2>/dev/null || true
+  fi
+}
+
+ensure_npm_global_version() {
+  local label="$1"
+  local package_spec="$2"
+  local module_dir="$3"
+  local desired="$4"
+  local installed
+
+  installed="$(installed_node_module_version "$module_dir")"
+  if [ "$installed" = "$desired" ]; then
+    echo "$label: already $desired"
+    return 0
+  fi
+
+  echo "$label: installing $desired (currently ${installed:-missing})"
+  "$NPM_BIN" install -g "$package_spec@$desired"
+}
+
+# Full install contract for the dev-owned native Claude Code.
+# Prints the version and returns 0 only when EVERY clause holds. Presence is
+# deliberately not sufficient: $DEV_HOME/.local/bin precedes both nvm and
+# /usr/bin on the dev's PATH, so a broken file there shadows every other copy
+# and a presence-only gate would let it wedge the box forever.
+claude_contract_version() {
+  local resolved version
+
+  # -f follows symlinks: a symlink to a regular file passes, a directory fails.
+  [ -f "$CLAUDE_BIN" ] || return 1
+  resolved="$(readlink -f "$CLAUDE_BIN")" || return 1
+  [ -f "$resolved" ] || return 1
+  [ "$(stat -c %U "$resolved")" = "$DEV_USER" ] || return 1
+  [ -x "$resolved" ] || return 1
+
+  # Both clauses matter: a binary that exits 0 while printing nothing is not a
+  # working Claude Code, and an exit-status-only check would accept it.
+  version="$(cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+    HOME="$DEV_HOME" \
+    "$CLAUDE_BIN" --version 2>/dev/null)" || return 1
+  [ -n "$version" ] || return 1
+
+  printf '%s\n' "$version"
+}
+
+# The marker is a CACHE of claude_contract_version, never a substitute for it.
+# Rewrite only on absence or a version change, so the install timestamp stays
+# the fleet's drift trail instead of being reset on every converge.
+claude_record_success() {
+  local version="$1"
+
+  # head -1 is defensive: real Claude Code prints one line, but `cut` alone
+  # emits one field PER LINE, so a multi-line --version string would never
+  # compare equal here and the marker would be rewritten every converge,
+  # destroying the fleet's only drift trail.
+  if [ -f "$CLAUDE_SUCCESS_FILE" ] \
+      && [ "$(cut -d' ' -f1 < "$CLAUDE_SUCCESS_FILE" | head -1)" = "${version%% *}" ]; then
+    return 0
+  fi
+
+  install -d -m 0755 "$(dirname "$CLAUDE_SUCCESS_FILE")" || return 1
+  printf '%s installed=%s\n' "$version" "$(date -u --iso-8601=seconds)" \
+    > "$CLAUDE_REQUIRED_FILE" || return 1
+  mv -f "$CLAUDE_REQUIRED_FILE" "$CLAUDE_SUCCESS_FILE" || return 1
+}
+
+ensure_claude_code() {
+  local installer version
+
+  # The contract is recomputed EVERY converge; the marker only caches it.
+  if version="$(claude_contract_version)"; then
+    claude_record_success "$version" || return 1
+    remove_legacy_claude_installs || return 1
+    echo "claude-code: already installed $version"
+    return 0
+  fi
+
+  # Contract failed. Invalidate the marker BEFORE repairing, so cleanup,
+  # ensure_agent_plugins, and devbox-bedrock-config all see "not verified"
+  # for the entire window in which claude is broken. Without this the marker
+  # outlives the condition it attests.
+  rm -f "$CLAUDE_SUCCESS_FILE" || return 1
+
+  installer="$(mktemp)" || return 1
+  if ! curl -fsSL "$CLAUDE_INSTALLER_URL" -o "$installer"; then
+    rm -f "$installer"
+    return 1
+  fi
+  if ! chown "$DEV_USER" "$installer"; then
+    rm -f "$installer"
+    return 1
+  fi
+
+  # Clear the target path now, immediately before running the installer --
+  # not as soon as the contract failed. install.sh delegates to
+  # `claude install <target>` WITHOUT --force, so an existing file can make the
+  # repair a no-op; and a root-owned leftover from the retired system install
+  # cannot be overwritten by $DEV_USER at all. Removing it is safe precisely
+  # because it just failed the contract -- no working claude is being
+  # discarded. Doing this last, once the installer is downloaded and
+  # dev-owned and is about to run, narrows the no-claude window to "the
+  # installer itself ran and failed" instead of also covering "mktemp or
+  # curl happened to fail" -- a box must never end up with no claude at all
+  # just because the disk or network hiccuped on the way to a repair.
+  if [ -e "$CLAUDE_BIN" ] || [ -L "$CLAUDE_BIN" ]; then
+    if ! rm -rf "$CLAUDE_BIN"; then
+      rm -f "$installer"
+      return 1
+    fi
+  fi
+
+  # cd first: the installer runs as $DEV_USER but inherits the caller's CWD --
+  # an admin converge from an SSH session sits in a home directory dev cannot
+  # read (same rule as ensure_codex_cli and ensure_agent_plugins).
+  # install.sh verifies the downloaded binary against the SHA-256 in the
+  # release manifest itself, so no local sha pin is needed.
+  if ! (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+      HOME="$DEV_HOME" \
+      bash "$installer" "$CLAUDE_INSTALL_TARGET"); then
+    rm -f "$installer"
+    return 1
+  fi
+  rm -f "$installer"
+
+  if ! version="$(claude_contract_version)"; then
+    echo "claude-code: install did not satisfy the contract at $CLAUDE_BIN" >&2
+    return 1
+  fi
+  claude_record_success "$version" || return 1
+  remove_legacy_claude_installs || return 1
+  echo "claude-code: installed $version"
+}
+
+# Retire the two pre-native installs. Guarded on the success marker, which
+# (per ensure_claude_code) exists only while the contract currently passes --
+# so there is no state in which the fallbacks are deleted while the new binary
+# is broken. A box that cannot satisfy the contract keeps both and stays
+# working on the nvm copy.
+#
+# Known deferred defect: the nvm package directory is removed but its
+# bin/claude symlink is left dangling. See the spec's deferred-findings list.
+remove_legacy_claude_installs() {
+  local nvm_pkg
+
+  [ -f "$CLAUDE_SUCCESS_FILE" ] || return 0
+
+  if [ -e "$CLAUDE_OLD_SYSTEM_BIN" ] || [ -L "$CLAUDE_OLD_SYSTEM_BIN" ]; then
+    rm -f "$CLAUDE_OLD_SYSTEM_BIN" || return 1
+  fi
+  if [ -d "$CLAUDE_OLD_NPM_DIR" ]; then
+    rm -rf "$CLAUDE_OLD_NPM_DIR" || return 1
+  fi
+  for nvm_pkg in "$CLAUDE_NVM_ROOT"/*/lib/node_modules/@anthropic-ai/claude-code; do
+    [ -d "$nvm_pkg" ] || continue
+    rm -rf "$nvm_pkg" || return 1
+  done
+}
+
+ensure_codex_cli() {
+  local installer
+
+  if [ -f "$CODEX_SUCCESS_FILE" ]; then
+    if ! rm -f "$CODEX_REQUIRED_FILE"; then
+      return 1
+    fi
+    echo "codex-cli: skipped (already installed for this root)"
+    return 0
+  fi
+
+  # New-machines-only window: this gate is correct ONLY because the GCP
+  # startup script writes $BOOTSTRAP_COMPLETE_FILE strictly last (B11) —
+  # so "bucket file exists but complete doesn't" can only be true during
+  # a box's first bootstrap. If B11 ever stops being last, existing boxes
+  # would start opting themselves in here.
+  if [ -f "$GCP_RUNTIME_BUCKET_FILE" ] \
+      && [ ! -f "$BOOTSTRAP_COMPLETE_FILE" ] \
+      && [ ! -f "$CODEX_SUCCESS_FILE" ]; then
+    install -d -m 0755 "$(dirname "$CODEX_REQUIRED_FILE")"
+    touch "$CODEX_REQUIRED_FILE"
+  fi
+
+  if [ ! -f "$CODEX_REQUIRED_FILE" ]; then
+    echo "codex-cli: skipped (not required for this devbox)"
+    return 0
+  fi
+
+  installer="$(mktemp)"
+  if ! curl -fsSL "$CODEX_INSTALLER_URL" -o "$installer"; then
+    rm -f "$installer"
+    return 1
+  fi
+
+  if ! chown "$DEV_USER" "$installer"; then
+    rm -f "$installer"
+    return 1
+  fi
+
+  # cd first: the installer (and its internal find) runs as $DEV_USER but
+  # inherits the caller's CWD — an admin converge from an SSH session sits
+  # in a home directory dev can't read, and find dies restoring it.
+  if ! (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+      HOME="$DEV_HOME" \
+      CODEX_NON_INTERACTIVE=1 \
+      CODEX_INSTALL_DIR="$CODEX_INSTALL_DIR" \
+      sh "$installer"); then
+    rm -f "$installer"
+    return 1
+  fi
+  rm -f "$installer"
+
+  local codex_version
+  if ! codex_version="$(cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+      HOME="$DEV_HOME" \
+      "$CODEX_BIN" --version)"; then
+    return 1
+  fi
+
+  install -d -m 0755 "$(dirname "$CODEX_SUCCESS_FILE")"
+  # Stamp the installed version into the marker (via the required file, so
+  # the required->success transition stays a single atomic mv): installs
+  # are unpinned (latest at box-creation time), so this is the only drift
+  # audit trail.
+  if ! printf '%s installed=%s\n' "$codex_version" "$(date -u --iso-8601=seconds)" \
+      > "$CODEX_REQUIRED_FILE"; then
+    return 1
+  fi
+  if ! mv -f "$CODEX_REQUIRED_FILE" "$CODEX_SUCCESS_FILE"; then
+    return 1
+  fi
+  echo "codex-cli: installed $codex_version"
+}
+
+ensure_codex_connectors_file() {
+  # Org MCP connectors for Codex, delivered via the runtime manifest env as
+  # JSON (see gcp/variables.tf codex_mcp_connectors). devbox-onboard merges
+  # them into each dev's ~/.codex/config.toml at first onboarding.
+  local target="${DEVBOX_CONNECTORS_FILE:-/etc/devbox-connectors.json}"
+  local payload="${DEVBOX_CODEX_MCP_CONNECTORS:-}"
+
+  if [ -z "$payload" ] || [ "$payload" = "{}" ]; then
+    rm -f "$target"
+    echo "codex connectors: none configured"
+    return 0
+  fi
+
+  if ! printf '%s' "$payload" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    echo "codex connectors: DEVBOX_CODEX_MCP_CONNECTORS is not valid JSON" >&2
+    return 1
+  fi
+
+  local tmp
+  tmp="$(mktemp "${target}.tmp.XXXXXX")"
+  printf '%s' "$payload" > "$tmp"
+  chmod 0644 "$tmp"
+  mv -- "$tmp" "$target"
+  echo "codex connectors: wrote $target"
+}
+
+ensure_paseo_daemon() {
+  local runner_tmp service_tmp
+
+  # The runtime-managed GCP fleet owns this service lifecycle. Boxes outside it
+  # (no runtime-bucket file) stay unchanged even if one happens to carry a
+  # Paseo marker.
+  if [ ! -f "$GCP_RUNTIME_BUCKET_FILE" ]; then
+    return 0
+  fi
+
+  if [ ! -x "$PASEO_BIN" ] \
+      && [ ! -x "$PASEO_SYSTEM_BIN" ] \
+      && [ ! -x "$PASEO_LEGACY_BIN" ]; then
+    echo "paseo: cannot enable daemon; no Paseo command is installed" >&2
+    return 1
+  fi
+
+  runner_tmp="$(mktemp)" || return 1
+  service_tmp="$(mktemp)" || {
+    rm -f "$runner_tmp"
+    return 1
+  }
+
+  if ! printf '#!/usr/bin/env bash\nset -euo pipefail\n\npaseo_bin=""\nfor candidate in %q %q %q; do\n  if [ -x "$candidate" ]; then\n    paseo_bin="$candidate"\n    break\n  fi\ndone\n[ -n "$paseo_bin" ] || { echo "paseo daemon: command unavailable" >&2; exit 1; }\n\n# Let an existing detached daemon finish naturally. Once its PID is no longer\n# running—or after a reboot, when none exists—hand the foreground process to\n# systemd. `daemon status` exits successfully for stopped daemons, so inspect\n# its structured state instead of its exit code.\nwhile status_json="$("$paseo_bin" daemon status --json 2>/dev/null)"; do\n  daemon_state="$(printf "%%s\\n" "$status_json" | /usr/bin/jq -er ".localDaemon | strings")" \\\n    || break\n  case "$daemon_state" in\n    running|unresponsive) sleep 5 ;;\n    *) break ;;\n  esac\ndone\nexec "$paseo_bin" daemon start --foreground\n' \
+      "$PASEO_BIN" "$PASEO_SYSTEM_BIN" "$PASEO_LEGACY_BIN" > "$runner_tmp" \
+      || ! chmod 0755 "$runner_tmp" \
+      || ! printf '[Unit]\nDescription=Paseo daemon\nWants=network-online.target tailscaled.service\nAfter=network-online.target tailscaled.service\nRequiresMountsFor=%s\n\n[Service]\nType=simple\nUser=%s\nGroup=%s\nWorkingDirectory=%s\nEnvironment=HOME=%s\nEnvironment=PATH=%s:%s/.nvm/versions/node/v%s/bin:%s:/usr/bin:/bin\nExecStart=%s\nRestart=always\nRestartSec=5s\nKillMode=control-group\nTimeoutStopSec=30s\nUMask=0077\n\n[Install]\nWantedBy=multi-user.target\n' \
+        "$DEV_HOME" "$DEV_USER" "$DEV_USER" "$DEV_HOME" "$DEV_HOME" \
+        "$(dirname "$PASEO_BIN")" "$DEV_HOME" "$DEVBOX_NODE_VERSION" \
+        "$(dirname "$PASEO_SYSTEM_BIN")" \
+        "$PASEO_DAEMON_RUNNER" > "$service_tmp"; then
+    rm -f "$runner_tmp" "$service_tmp"
+    return 1
+  fi
+
+  if [ ! -f "$PASEO_DAEMON_RUNNER" ] || ! cmp -s "$runner_tmp" "$PASEO_DAEMON_RUNNER"; then
+    if ! install -d -m 0755 "$(dirname "$PASEO_DAEMON_RUNNER")" \
+        || ! install -m 0755 "$runner_tmp" "$PASEO_DAEMON_RUNNER"; then
+      rm -f "$runner_tmp" "$service_tmp"
+      return 1
+    fi
+  fi
+  if [ ! -f "$PASEO_DAEMON_SERVICE_FILE" ] \
+      || ! cmp -s "$service_tmp" "$PASEO_DAEMON_SERVICE_FILE"; then
+    if ! install -d -m 0755 "$(dirname "$PASEO_DAEMON_SERVICE_FILE")" \
+        || ! install -m 0644 "$service_tmp" "$PASEO_DAEMON_SERVICE_FILE"; then
+      rm -f "$runner_tmp" "$service_tmp"
+      return 1
+    fi
+  fi
+  rm -f "$runner_tmp" "$service_tmp"
+
+  # Always reload, even when the rendered files are unchanged. A prior reload
+  # may have failed after the files landed; the next convergence must retry it.
+  if ! systemctl daemon-reload; then
+    return 1
+  fi
+  systemctl enable --now paseo.service
+}
+
+ensure_paseo() {
+  local config_base="" config_source config_tmp dns_name ip_octet launcher_tmp paseo_version short_name
+  local tailscale_ip tailscale_status
+
+  if [ -f "$PASEO_SUCCESS_FILE" ]; then
+    rm -f "$PASEO_REQUIRED_FILE" || return 1
+    ensure_paseo_daemon || return 1
+    echo "paseo: skipped (already installed for this root)"
+    return 0
+  fi
+
+  # Match the Codex new-machine gate above: only a GCP box whose first
+  # bootstrap is still incomplete may arm installation. The requirement
+  # marker survives bootstrap completion so transient npm/Tailscale failures
+  # remain retryable by later convergence runs.
+  if [ -f "$GCP_RUNTIME_BUCKET_FILE" ] \
+      && [ ! -f "$BOOTSTRAP_COMPLETE_FILE" ]; then
+    install -d -m 0755 "$(dirname "$PASEO_REQUIRED_FILE")"
+    touch "$PASEO_REQUIRED_FILE"
+  fi
+
+  if [ ! -f "$PASEO_REQUIRED_FILE" ]; then
+    echo "paseo: skipped (not required for this devbox)"
+    return 0
+  fi
+
+  if ! install -d -o "$DEV_USER" -g "$DEV_USER" -m 0755 "$PASEO_NPM_PREFIX"; then
+    return 1
+  fi
+  if ! (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+      HOME="$DEV_HOME" \
+      NPM_CONFIG_PREFIX="$PASEO_NPM_PREFIX" \
+      "$NPM_BIN" install -g @getpaseo/cli@latest); then
+    return 1
+  fi
+  if [ ! -x "$PASEO_USER_BIN" ] || [ ! -d "$PASEO_PACKAGE_DIR" ]; then
+    echo "paseo: npm install did not create the expected user-owned package" >&2
+    return 1
+  fi
+  if [ "$(stat -c '%U:%G' "$PASEO_NPM_PREFIX")" != "$DEV_USER:$DEV_USER" ] \
+      || [ "$(stat -c '%U:%G' "$PASEO_USER_BIN")" != "$DEV_USER:$DEV_USER" ] \
+      || [ "$(stat -c '%U:%G' "$PASEO_PACKAGE_DIR")" != "$DEV_USER:$DEV_USER" ]; then
+    echo "paseo: npm prefix and package must be owned by $DEV_USER" >&2
+    return 1
+  fi
+
+  launcher_tmp="$(mktemp)" || return 1
+  if ! chmod 0600 "$launcher_tmp" \
+      || ! printf '#!/usr/bin/env bash\nset -euo pipefail\nexport NPM_CONFIG_PREFIX=%q\nexec %q "$@"\n' \
+        "$PASEO_NPM_PREFIX" "$PASEO_USER_BIN" > "$launcher_tmp" \
+      || ! install -d -o "$DEV_USER" -g "$DEV_USER" -m 0755 "$(dirname "$PASEO_BIN")" \
+      || ! install -o "$DEV_USER" -g "$DEV_USER" -m 0755 "$launcher_tmp" "$PASEO_BIN" \
+      || ! install -d -m 0755 "$(dirname "$PASEO_SYSTEM_BIN")" \
+      || ! install -m 0755 "$launcher_tmp" "$PASEO_SYSTEM_BIN"; then
+    rm -f "$launcher_tmp"
+    return 1
+  fi
+  rm -f "$launcher_tmp"
+
+  if ! paseo_version="$(cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+      HOME="$DEV_HOME" \
+      NPM_CONFIG_PREFIX="$PASEO_NPM_PREFIX" \
+      "$PASEO_BIN" --version)"; then
+    return 1
+  fi
+
+  if ! tailscale_ip="$("$TAILSCALE_BIN" ip -4)"; then
+    return 1
+  fi
+  # Command substitution removes the final newline. Any remaining newline
+  # means Tailscale returned more than one IPv4 address, which would make the
+  # listen address ambiguous.
+  if [ -z "$tailscale_ip" ] || [[ "$tailscale_ip" == *$'\n'* ]]; then
+    echo "paseo: expected exactly one Tailscale IPv4 address" >&2
+    return 1
+  fi
+  IFS=. read -r -a ip_octet <<< "$tailscale_ip"
+  if [ "${#ip_octet[@]}" -ne 4 ]; then
+    echo "paseo: malformed Tailscale IPv4 address: $tailscale_ip" >&2
+    return 1
+  fi
+  local octet
+  for octet in "${ip_octet[@]}"; do
+    if [[ ! "$octet" =~ ^[0-9]{1,3}$ ]] || ((10#$octet > 255)); then
+      echo "paseo: malformed Tailscale IPv4 address: $tailscale_ip" >&2
+      return 1
+    fi
+  done
+
+  if ! tailscale_status="$("$TAILSCALE_BIN" status --json)"; then
+    return 1
+  fi
+  if ! dns_name="$(jq -er '.Self.DNSName | strings | select(length > 1)' \
+      <<< "$tailscale_status")"; then
+    echo "paseo: Tailscale status did not include Self.DNSName" >&2
+    return 1
+  fi
+  dns_name="${dns_name%.}"
+  if [[ "$dns_name" != *.* ]] \
+      || [[ ! "$dns_name" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])$ ]]; then
+    echo "paseo: malformed Tailscale MagicDNS name: $dns_name" >&2
+    return 1
+  fi
+  short_name="${dns_name%%.*}"
+
+  if ! install -d -o "$DEV_USER" -g "$DEV_USER" -m 0700 "$PASEO_CONFIG_DIR"; then
+    return 1
+  fi
+  config_tmp="$(mktemp "$PASEO_CONFIG_DIR/.config.json.XXXXXX")" || return 1
+  if [ -e "$PASEO_CONFIG_FILE" ]; then
+    if [ ! -f "$PASEO_CONFIG_FILE" ] \
+        || ! jq -e 'type == "object"' "$PASEO_CONFIG_FILE" >/dev/null 2>&1; then
+      echo "paseo: existing config is not a valid JSON object" >&2
+      rm -f "$config_tmp"
+      return 1
+    fi
+    config_source="$PASEO_CONFIG_FILE"
+  else
+    config_base="$(mktemp "$PASEO_CONFIG_DIR/.config.base.XXXXXX")" || {
+      rm -f "$config_tmp"
+      return 1
+    }
+    if ! printf '{}\n' > "$config_base"; then
+      rm -f "$config_base" "$config_tmp"
+      return 1
+    fi
+    config_source="$config_base"
+  fi
+
+  if ! jq \
+      --arg listen "$tailscale_ip:6767" \
+      --arg ip_origin "http://$tailscale_ip:6767" \
+      --arg short_name "$short_name" \
+      --arg short_origin "http://$short_name:6767" \
+      --arg dns_name "$dns_name" \
+      --arg dns_origin "http://$dns_name:6767" \
+      '
+        (if length == 0 then {} else . end)
+        | .["$schema"] = "https://paseo.sh/schemas/paseo.config.v1.json"
+        | .version = 1
+        | .daemon = ((.daemon // {}) + {
+            listen: $listen,
+            hostnames: [$short_name, $dns_name],
+            cors: ((.daemon.cors // {}) + {
+              allowedOrigins: [
+                "https://app.paseo.sh",
+                $ip_origin,
+                $short_origin,
+                $dns_origin
+              ]
+            }),
+            relay: ((.daemon.relay // {}) + {enabled: false})
+          })
+        | .features = ((.features // {}) + {
+            webUi: ((.features.webUi // {}) + {enabled: false})
+          })
+      ' "$config_source" > "$config_tmp"; then
+    rm -f "$config_base" "$config_tmp"
+    return 1
+  fi
+  rm -f "$config_base"
+  if ! chown "$DEV_USER:$DEV_USER" "$config_tmp" \
+      || ! chmod 0600 "$config_tmp" \
+      || ! mv -f "$config_tmp" "$PASEO_CONFIG_FILE"; then
+    rm -f "$config_tmp"
+    return 1
+  fi
+  if [ "$(stat -c '%U:%G:%a' "$PASEO_CONFIG_DIR")" != "$DEV_USER:$DEV_USER:700" ] \
+      || [ "$(stat -c '%U:%G:%a' "$PASEO_CONFIG_FILE")" != "$DEV_USER:$DEV_USER:600" ] \
+      || ! jq -e \
+        --arg listen "$tailscale_ip:6767" \
+        --arg dns_name "$dns_name" \
+        --arg short_name "$short_name" \
+        '.version == 1
+         and .daemon.listen == $listen
+         and .daemon.hostnames == [$short_name, $dns_name]
+         and .daemon.relay.enabled == false
+         and .features.webUi.enabled == false' \
+        "$PASEO_CONFIG_FILE" >/dev/null; then
+    echo "paseo: config validation failed" >&2
+    return 1
+  fi
+
+  if ! printf '%s installed=%s\n' "$paseo_version" "$(date -u --iso-8601=seconds)" \
+      > "$PASEO_REQUIRED_FILE"; then
+    return 1
+  fi
+  mv -f "$PASEO_REQUIRED_FILE" "$PASEO_SUCCESS_FILE" || return 1
+  ensure_paseo_daemon || return 1
+  echo "paseo: installed $paseo_version"
+}
+
+install_vscode_launcher() {
+  local launcher_dir tmp
+
+  launcher_dir="$(dirname "$VSCODE_LAUNCHER")"
+  install -d -m 0755 "$launcher_dir"
+  tmp="$(mktemp)"
+
+  if ! cat > "$tmp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+code_bin="${DEVBOX_VSCODE_BIN:-/usr/bin/code}"
+tailscale_bin="${DEVBOX_TAILSCALE_BIN:-/usr/bin/tailscale}"
+
+[ -x "$code_bin" ] || {
+  echo "FATAL: VS Code command is unavailable: $code_bin" >&2
+  exit 1
+  }
+[ -x "$tailscale_bin" ] || {
+  echo "FATAL: Tailscale command is unavailable: $tailscale_bin" >&2
+  exit 1
+  }
+
+"$tailscale_bin" serve --yes --bg 8000
+exec "$code_bin" serve-web --host 127.0.0.1 --without-connection-token --port 8000
+EOF
+  then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if ! install -m 0755 "$tmp" "$VSCODE_LAUNCHER"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
+ensure_vscode() {
+  local vscode_version
+
+  if [ -f "$VSCODE_SUCCESS_FILE" ]; then
+    if ! install_vscode_launcher; then
+      return 1
+    fi
+    if ! rm -f "$VSCODE_REQUIRED_FILE"; then
+      return 1
+    fi
+    echo "vscode: skipped (already installed for this root)"
+    return 0
+  fi
+
+  # A GCP new-machine bootstrap is the only eligible window. The retry marker
+  # intentionally survives bootstrap completion, so a transient APT failure
+  # retries on a later converge without enrolling existing boxes.
+  if [ -f "$GCP_RUNTIME_BUCKET_FILE" ] \
+      && [ ! -f "$BOOTSTRAP_COMPLETE_FILE" ] \
+      && [ ! -f "$VSCODE_SUCCESS_FILE" ]; then
+    install -d -m 0755 "$(dirname "$VSCODE_REQUIRED_FILE")"
+    touch "$VSCODE_REQUIRED_FILE"
+  fi
+
+  if [ ! -f "$VSCODE_REQUIRED_FILE" ]; then
+    echo "vscode: skipped (not required for this devbox)"
+    return 0
+  fi
+
+  download_dearmored_keyring \
+    https://packages.microsoft.com/keys/microsoft.asc \
+    "$APT_KEYRING_DIR/microsoft.gpg"
+  write_apt_source \
+    "$APT_SOURCE_DIR/vscode.sources" \
+    "Types: deb
+URIs: https://packages.microsoft.com/repos/code
+Suites: stable
+Components: main
+Architectures: amd64
+Signed-By: $APT_KEYRING_DIR/microsoft.gpg"
+
+  ensure_apt_package_version code "$VSCODE_VERSION"
+
+  # VS Code intentionally refuses to run as root without --no-sandbox. Verify
+  # the installed CLI in the same user context that will run the launcher.
+  if ! vscode_version="$(cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+      HOME="$DEV_HOME" \
+      "$VSCODE_BIN" --version | head -n1)"; then
+    return 1
+  fi
+  if [ -z "$vscode_version" ]; then
+    echo "FATAL: VS Code did not report a version" >&2
+    return 1
+  fi
+  if ! (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+      HOME="$DEV_HOME" \
+      "$VSCODE_BIN" serve-web --help >/dev/null); then
+    echo "FATAL: VS Code serve-web is unavailable" >&2
+    return 1
+  fi
+  if ! install_vscode_launcher; then
+    return 1
+  fi
+
+  if ! printf '%s installed=%s\n' "$vscode_version" "$(date -u --iso-8601=seconds)" \
+      > "$VSCODE_REQUIRED_FILE"; then
+    return 1
+  fi
+  if ! mv -f "$VSCODE_REQUIRED_FILE" "$VSCODE_SUCCESS_FILE"; then
+    return 1
+  fi
+  echo "vscode: installed $vscode_version"
+}
+
+ensure_agent_plugins() {
+  if [ -f "$AGENT_PLUGINS_SUCCESS_FILE" ]; then
+    rm -f "$AGENT_PLUGINS_REQUIRED_FILE"
+    echo "agent-plugins: skipped (already installed for this root)"
+    return 0
+  fi
+
+  # Arm provisioning only during a new GCP machine's first bootstrap. The
+  # retry marker survives bootstrap completion so transient marketplace
+  # failures can be retried by later convergence runs. Existing GCP boxes and
+  # non-GCP boxes never create this marker.
+  if [ -f "$GCP_RUNTIME_BUCKET_FILE" ] \
+      && [ ! -f "$BOOTSTRAP_COMPLETE_FILE" ]; then
+    install -d -m 0755 "$(dirname "$AGENT_PLUGINS_REQUIRED_FILE")"
+    touch "$AGENT_PLUGINS_REQUIRED_FILE"
+  fi
+
+  if [ ! -f "$AGENT_PLUGINS_REQUIRED_FILE" ]; then
+    echo "agent-plugins: skipped (not required for this devbox)"
+    return 0
+  fi
+
+  if [ ! -f "$CODEX_SUCCESS_FILE" ]; then
+    echo "agent-plugins: waiting for Codex installation" >&2
+    return 1
+  fi
+
+  # The MARKER, not [ -x "$CLAUDE_BIN" ]: an executable-bit check passes on
+  # exactly the broken binaries the install contract rejects, which would run
+  # plugin installs against a claude ensure_claude_code just refused.
+  # Ordering is not enough either -- claude-code runs before agent-plugins in
+  # the dispatch list, but run_tool continues past a failed concern.
+  if [ ! -f "$CLAUDE_SUCCESS_FILE" ]; then
+    echo "agent-plugins: waiting for Claude Code installation" >&2
+    return 1
+  fi
+
+  # The root converge process may inherit an OS Login/IAP home directory that
+  # dev cannot read. Claude's Git wrapper reports that bad inherited CWD as a
+  # misleading ERR_STREAM_PREMATURE_CLOSE, so cross the directory boundary
+  # before crossing the user boundary (the same rule used by Codex install).
+  (
+    cd "$DEV_HOME"
+    sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
+      "$CLAUDE_BIN" plugin marketplace add \
+        https://github.com/anthropics/claude-plugins-official.git --scope user
+    sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
+      "$CLAUDE_BIN" plugin install superpowers@claude-plugins-official --scope user
+    sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
+      "$CLAUDE_BIN" plugin marketplace add \
+        https://github.com/openai/codex-plugin-cc.git --scope user
+    sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
+      "$CLAUDE_BIN" plugin install codex@openai-codex --scope user
+    sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
+      "$CODEX_BIN" plugin marketplace add https://github.com/obra/superpowers.git
+    sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
+      "$CODEX_BIN" plugin add superpowers@superpowers-dev
+  )
+
+  printf 'installed=%s\n' "$(date -u --iso-8601=seconds)" \
+    > "$AGENT_PLUGINS_REQUIRED_FILE"
+  mv -f "$AGENT_PLUGINS_REQUIRED_FILE" "$AGENT_PLUGINS_SUCCESS_FILE"
+  echo "agent-plugins: installed Claude Superpowers, Claude Codex, and Codex Superpowers"
+}
+
+tmux_plugins_block() {
+  cat <<EOF
+# >>> devbox-managed: tmux plugins >>>
+set -g @continuum-restore 'on'
+run-shell $TMUX_PLUGINS_DIR/tmux-resurrect/resurrect.tmux
+run-shell $TMUX_PLUGINS_DIR/tmux-continuum/continuum.tmux
+# keep last: setting status-right after this silently disables autosave
+# <<< devbox-managed: tmux plugins <<<
+EOF
+}
+
+ensure_tmux_plugin_repo() {
+  local name="$1" commit="$2"
+  local dir="$TMUX_PLUGINS_DIR/$name"
+
+  if [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" = "$commit" ]; then
+    echo "tmux-plugins: $name already pinned to $commit"
+    return 0
+  fi
+  if [ ! -d "$dir/.git" ]; then
+    rm -rf "$dir"
+    git init -q "$dir"
+    git -C "$dir" remote add origin "https://github.com/tmux-plugins/$name.git"
+  fi
+  git -C "$dir" fetch -q --depth 1 origin "$commit"
+  git -C "$dir" checkout -q --force --detach "$commit"
+  echo "tmux-plugins: pinned $name to $commit"
+  tmux_plugins_changed=true
+}
+
+ensure_tmux_conf_block() {
+  local begin end desired current rebuilt
+  begin='# >>> devbox-managed: tmux plugins >>>'
+  end='# <<< devbox-managed: tmux plugins <<<'
+  desired="$(tmux_plugins_block)"
+
+  # The baseline conf belongs to bootstrap (which writes it after its
+  # boot-time converge — the startup template is a fleet-rebuild keeper, so
+  # that ordering is not worth changing). A missing file means a home dir
+  # this concern must not shape: never create it here; on a fresh machine
+  # the block simply lands on the first timer converge after bootstrap.
+  if [ ! -f "$TMUX_CONF_FILE" ]; then
+    echo "tmux-plugins: $TMUX_CONF_FILE missing; leaving the baseline to bootstrap"
+    return 0
+  fi
+
+  current="$(awk -v b="$begin" -v e="$end" '$0==b{f=1} f{print} $0==e{f=0}' "$TMUX_CONF_FILE")"
+  if [ "$current" = "$desired" ]; then
+    echo "tmux-plugins: managed block current in $TMUX_CONF_FILE"
+    return 0
+  fi
+
+  # Rebuild without the old block (and its trailing blank run), then append
+  # the block at the end — continuum must load after the user's status-right.
+  rebuilt="$(mktemp)"
+  {
+    awk -v b="$begin" -v e="$end" '
+      $0==b {inblock=1; next}
+      inblock && $0==e {inblock=0; next}
+      inblock {next}
+      NF {for (i=0; i<blanks; i++) print ""; blanks=0; print; next}
+      {blanks++}
+    ' "$TMUX_CONF_FILE"
+    printf '\n%s\n' "$desired"
+  } > "$rebuilt"
+  install -o "$DEV_USER" -g "$DEV_USER" -m 0644 "$rebuilt" "$TMUX_CONF_FILE" 2>/dev/null \
+    || install -m 0644 "$rebuilt" "$TMUX_CONF_FILE"
+  rm -f "$rebuilt"
+  echo "tmux-plugins: wrote managed block to $TMUX_CONF_FILE"
+  tmux_plugins_changed=true
+}
+
+tmux_live_source() {
+  local uid sock
+  uid="$(id -u "$DEV_USER" 2>/dev/null || true)"
+  sock="${TMUX_SOCKET:-/tmp/tmux-$uid/default}"
+  if [ -z "$uid" ] || [ ! -S "$sock" ]; then
+    echo "tmux-plugins: no running tmux server; plugins load on the next tmux start"
+    return 0
+  fi
+  # Reload the dev's own config in their live server so months-old sessions
+  # (the thing resurrect protects) start autosaving now, not after a restart.
+  if (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H "$TMUX_BIN" source-file "$TMUX_CONF_FILE"); then
+    echo "tmux-plugins: reloaded config in the running tmux server"
+  else
+    echo "WARN: could not reload the running tmux server; plugins load on the next tmux start" >&2
+  fi
+}
+
+ensure_tmux_plugins() {
+  tmux_plugins_changed=false
+
+  install -d -m 0755 "$TMUX_PLUGINS_DIR"
+  ensure_tmux_plugin_repo tmux-resurrect "$DEVBOX_TMUX_RESURRECT_COMMIT"
+  ensure_tmux_plugin_repo tmux-continuum "$DEVBOX_TMUX_CONTINUUM_COMMIT"
+  ensure_tmux_conf_block
+
+  if [ "$tmux_plugins_changed" = true ]; then
+    tmux_live_source
+  fi
+}
+
+ensure_google_chrome() {
+  download_dearmored_keyring \
+    https://dl.google.com/linux/linux_signing_key.pub \
+    "$APT_KEYRING_DIR/google-chrome.gpg"
+  write_apt_source \
+    "$APT_SOURCE_DIR/google-chrome.list" \
+    "deb [arch=amd64 signed-by=$APT_KEYRING_DIR/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main"
+
+  ensure_apt_package_version google-chrome-stable "$DEVBOX_GOOGLE_CHROME_VERSION"
+  ensure_apt_package libnss3
+  ensure_apt_package libgbm1
+  ensure_apt_package libasound2t64
+  ensure_apt_package fonts-liberation
+}
+
+ensure_chrome_devtools_mcp() {
+  ensure_npm_global_version \
+    chrome-devtools-mcp \
+    chrome-devtools-mcp \
+    "$NPM_GLOBAL_DIR/chrome-devtools-mcp" \
+    "$DEVBOX_CHROME_DEVTOOLS_MCP_VERSION"
+
+  for f in "$NODE_BIN" "$NPM_GLOBAL_DIR/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js" "$CHROME_BIN"; do
+    [ -e "$f" ] || { echo "FATAL: chrome-devtools-mcp pinned binary missing: $f" >&2; exit 1; }
+  done
+}
+
+ensure_aws_cli() {
+  local installed=""
+  local aws_tmp
+
+  if command -v aws >/dev/null 2>&1; then
+    installed="$(aws --version 2>&1 | awk '{print $1}' | cut -d/ -f2)"
+  fi
+
+  if [ "$installed" = "$DEVBOX_AWS_CLI_VERSION" ]; then
+    echo "aws-cli: already $DEVBOX_AWS_CLI_VERSION"
+    return 0
+  fi
+
+  echo "aws-cli: installing $DEVBOX_AWS_CLI_VERSION (currently ${installed:-missing})"
+  aws_tmp="$(mktemp -d)"
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${DEVBOX_AWS_CLI_VERSION}.zip" \
+    -o "$aws_tmp/awscliv2.zip"
+  echo "$DEVBOX_AWS_CLI_INSTALL_SHA256  $aws_tmp/awscliv2.zip" | sha256sum -c -
+  unzip -q "$aws_tmp/awscliv2.zip" -d "$aws_tmp"
+  "$aws_tmp/aws/install" -i /usr/local/aws-cli -b /usr/local/bin --update
+  rm -rf "$aws_tmp"
+
+  installed="$(/usr/local/bin/aws --version 2>&1 | awk '{print $1}' | cut -d/ -f2)"
+  [ "$installed" = "$DEVBOX_AWS_CLI_VERSION" ] \
+    || { echo "FATAL: aws cli version mismatch: expected $DEVBOX_AWS_CLI_VERSION, got $installed" >&2; exit 1; }
+}
+
+run_tool() {
+  local label="$1"
+  shift
+  local rc
+
+  set +e
+  ( set -euo pipefail; "$@" )
+  rc=$?
+  set -e
+
+  if [ "$rc" -ne 0 ]; then
+    echo "ERROR: $label failed with exit $rc" >&2
+    failures+=("$label")
+  fi
+}
+
+run_tool base-tools ensure_base_tools
+run_tool tailscale ensure_tailscale_package
+run_tool gh ensure_gh
+run_tool docker ensure_docker
+run_tool system-node ensure_system_node
+run_tool nvm-dev-node ensure_nvm_and_dev_node
+run_tool claude-code ensure_claude_code
+run_tool codex-cli ensure_codex_cli
+run_tool codex-connectors ensure_codex_connectors_file
+run_tool paseo ensure_paseo
+run_tool vscode ensure_vscode
+run_tool agent-plugins ensure_agent_plugins
+run_tool tmux-plugins ensure_tmux_plugins
+run_tool google-chrome ensure_google_chrome
+run_tool chrome-devtools-mcp ensure_chrome_devtools_mcp
+run_tool aws-cli ensure_aws_cli
+
+if [ "${#failures[@]}" -ne 0 ]; then
+  printf 'toolchain incomplete; failed tools:' >&2
+  printf ' %s' "${failures[@]}" >&2
+  printf '\n' >&2
+  exit 1
+fi
+
+echo "devbox-toolchain complete"

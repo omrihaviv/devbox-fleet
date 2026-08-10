@@ -1,0 +1,412 @@
+#!/bin/bash
+# devbox-onboard — first-login per-dev setup.
+# Idempotent: every step checks "am I already done" and is safe to re-run.
+# Synced to running boxes out-of-band by scripts/sync-onboard.sh (no rebuild needed).
+
+set -euo pipefail
+
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+
+SENTINEL="${HOME}/.devbox-onboarded"
+REPOS_FILE="${HOME}/.devbox-repos"
+DEFAULT_REPOS="/etc/devbox-repos.default"
+
+if [ -f "$SENTINEL" ]; then
+  read -r -p "Already onboarded. Re-run anyway? [y/N] " ans
+  case "$ans" in
+    y|Y) ;;
+    *) exit 0 ;;
+  esac
+fi
+
+# ----- Step 1/8: GitHub authentication -----
+step_github_auth() {
+  echo "[1/8] GitHub authentication"
+  if gh auth status >/dev/null 2>&1; then
+    echo "  ✓ already authenticated as $(gh api user --jq .login)"
+    return 0
+  fi
+  gh auth login --web --git-protocol https
+}
+
+# ----- Step 2/8: Git config (GitHub noreply email) -----
+step_git_config() {
+  echo "[2/8] Git config"
+  if [ -n "$(git config --global --get user.email || true)" ]; then
+    echo "  ✓ already configured (user.email = $(git config --global --get user.email))"
+    return 0
+  fi
+
+  local user_login user_id user_name
+  user_login=$(gh api user --jq .login)
+  user_id=$(gh api user --jq .id)
+  user_name=$(gh api user --jq .name)
+  if [ -z "$user_name" ] || [ "$user_name" = "null" ]; then
+    user_name="$user_login"
+  fi
+
+  git config --global user.name  "$user_name"
+  git config --global user.email "${user_id}+${user_login}@users.noreply.github.com"
+  git config --global init.defaultBranch master
+  git config --global pull.rebase false
+
+  echo "  ✓ user.name  = $user_name"
+  echo "  ✓ user.email = ${user_id}+${user_login}@users.noreply.github.com"
+}
+
+# ----- Step 3/8: Claude Code authentication -----
+step_claude_auth() {
+  echo "[3/8] Claude Code authentication"
+  # Claude Code 2.x stores OAuth credentials at ~/.claude/.credentials.json
+  # (on persistent EBS via the /home bind mount). If present and non-empty,
+  # the user is already logged in.
+  if [ -s "${HOME}/.claude/.credentials.json" ]; then
+    echo "  ✓ already authenticated"
+    return 0
+  fi
+  echo "  Press Enter to start Claude Code login..."
+  read -r _
+  claude /login
+}
+
+# ----- Step 4/8: Chrome DevTools MCP -----
+step_chrome_mcp_config() {
+  echo "[4/8] Chrome DevTools MCP"
+  # Two MCP servers, distinct launch models:
+  #   chrome-devtools          — ephemeral, per-session Chrome with an
+  #                              isolated --user-data-dir. For unauthenticated
+  #                              work (scraping, screenshots).
+  #   chrome-devtools-steered  — attaches to chrome-steered.service via CDP at
+  #                              127.0.0.1:9222. Shares the dev's logged-in
+  #                              sessions on the persistent --user-data-dir.
+  #
+  # Existence check via `claude mcp get <name>` — exits 0 if the server is
+  # registered under any scope, non-zero otherwise. Robust to whatever format
+  # `claude mcp list` happens to print (which includes cloud-hosted servers
+  # with multi-word names like "claude.ai G2" and is easy to mis-parse).
+  if claude mcp get chrome-devtools >/dev/null 2>&1; then
+    echo "  ✓ chrome-devtools already registered"
+  else
+    claude mcp add chrome-devtools \
+      --scope user \
+      -- /usr/local/bin/chrome-devtools-mcp-wrapper
+    echo "  ✓ registered chrome-devtools (ephemeral, per-session Chrome)"
+  fi
+
+  if claude mcp get chrome-devtools-steered >/dev/null 2>&1; then
+    echo "  ✓ chrome-devtools-steered already registered"
+  else
+    claude mcp add chrome-devtools-steered \
+      --scope user \
+      -- /usr/local/bin/chrome-devtools-mcp-steered-wrapper
+    echo "  ✓ registered chrome-devtools-steered (attaches to chrome-steered.service)"
+  fi
+}
+
+# ----- Step 5/8: Codex MCP connectors (org-configured) -----
+step_codex_mcp_config() {
+  echo "[5/8] Codex MCP connectors"
+
+  local connectors_file="${DEVBOX_CONNECTORS_FILE:-/etc/devbox-connectors.json}"
+  if [ ! -s "$connectors_file" ]; then
+    echo "  no org connectors configured ($connectors_file absent) — skipping"
+    return 0
+  fi
+
+  # Codex fails configuration loading if its home directory does not exist.
+  mkdir -p "${HOME}/.codex"
+
+  # `codex mcp add` immediately starts OAuth for servers that advertise it,
+  # so write the config.toml tables directly to keep onboarding
+  # non-interactive. Parse before and after, and replace only after validation.
+  local codex_cfg="${HOME}/.codex/config.toml" codex_write_path
+  touch "$codex_cfg"
+  if ! codex_write_path="$(readlink -f -- "$codex_cfg")"; then
+    echo "  ⚠ cannot resolve ~/.codex/config.toml; refusing to add MCP servers" >&2
+    return 1
+  fi
+
+  # Compute the TOML tables to append: every connector not already present.
+  # stdout protocol: line 1 = already-registered names, line 2 = names being
+  # added, lines 3+ = the TOML appendix. Reporting stays in the step's voice
+  # instead of leaking python's internals to stderr.
+  local report
+  if ! report="$(python3 - "$codex_write_path" "$connectors_file" <<'PY'
+import json, sys, tomllib
+
+with open(sys.argv[1], "rb") as f:
+    config = tomllib.load(f)
+existing = config.get("mcp_servers", {})
+if not isinstance(existing, dict):
+    raise TypeError("mcp_servers must be a table")
+
+with open(sys.argv[2]) as f:
+    connectors = json.load(f)
+if not isinstance(connectors, dict):
+    raise TypeError("connectors file must be a JSON object")
+
+def toml_str(value):
+    # JSON basic-string escaping is valid TOML when non-BMP characters stay as
+    # Unicode scalars. JSON's default surrogate-pair escapes are invalid TOML.
+    return json.dumps(value, ensure_ascii=False)
+
+kept, added, out = [], [], []
+for name in sorted(connectors):
+    if name in existing:
+        kept.append(name)
+        continue
+    added.append(name)
+    server = connectors[name]
+    # A connector name is DATA: quote it, or a name like "logs.us" becomes a
+    # TOML path and silently nests the table under a "logs" server.
+    out.append(f"[mcp_servers.{toml_str(name)}]")
+    out.append(f"url = {toml_str(server['url'])}")
+    headers = server.get("http_headers") or {}
+    if headers:
+        pairs = ", ".join(f"{toml_str(k)} = {toml_str(v)}" for k, v in sorted(headers.items()))
+        out.append(f"http_headers = {{ {pairs} }}")
+    out.append("")
+print(" ".join(kept))
+print(" ".join(added))
+print("\n".join(out))
+PY
+  )"; then
+    echo "  ⚠ could not parse ~/.codex/config.toml or $connectors_file; refusing to add MCP servers" >&2
+    return 1
+  fi
+
+  # No brace-group/pipeline parsing here: a line starting with '}' would break
+  # the function extraction the tests rely on.
+  local -a kept_names=() new_names=()
+  local appendix
+  read -r -a kept_names <<< "$(printf '%s\n' "$report" | sed -n 1p)"
+  read -r -a new_names <<< "$(printf '%s\n' "$report" | sed -n 2p)"
+  appendix="$(printf '%s\n' "$report" | tail -n +3)"
+
+  if [ "${#new_names[@]}" -eq 0 ]; then
+    echo "  ✓ all org connectors already registered"
+    return 0
+  fi
+
+  local name
+  for name in "${kept_names[@]}"; do
+    echo "  ✓ $name already registered"
+  done
+
+  # Stage beside the target for an atomic rename, preserving metadata.
+  local tmp
+  tmp="$(mktemp "${codex_write_path}.tmp.XXXXXX")"
+  if ! cp --preserve=all -- "$codex_write_path" "$tmp"; then
+    rm -f "$tmp"
+    echo "  ⚠ cannot stage ~/.codex/config.toml with its metadata" >&2
+    return 1
+  fi
+  [ ! -s "$tmp" ] || printf '\n' >> "$tmp"
+  printf '%s\n' "$appendix" >> "$tmp"
+
+  if ! python3 - "$tmp" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    tomllib.load(f)
+PY
+  then
+    rm -f "$tmp"
+    echo "  ⚠ refusing to install invalid Codex TOML after adding MCP servers" >&2
+    return 1
+  fi
+  mv -- "$tmp" "$codex_write_path"
+  echo "  ✓ registered ${new_names[*]} for Codex (authenticate later with 'codex mcp login <name>')"
+}
+
+# ----- Step 6/8: Clone team repos into ~/work -----
+step_clone_repos() {
+  echo "[6/8] Cloning repos"
+  mkdir -p "${HOME}/work"
+
+  # First run: seed ~/.devbox-repos from the system default.
+  if [ ! -f "$REPOS_FILE" ] && [ -f "$DEFAULT_REPOS" ]; then
+    cp "$DEFAULT_REPOS" "$REPOS_FILE"
+  fi
+
+  if [ ! -f "$REPOS_FILE" ]; then
+    echo "  no repo list found at $REPOS_FILE — skipping"
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    # Strip comments and whitespace.
+    line="${line%%#*}"
+    line="${line//[[:space:]]/}"
+    [ -z "$line" ] && continue
+
+    local target="${HOME}/work/${line##*/}"
+    if [ -d "$target/.git" ]; then
+      echo "  ✓ ~/work/${line##*/} already cloned"
+      continue
+    fi
+    echo "  cloning $line..."
+    gh repo clone "$line" "$target"
+  done < "$REPOS_FILE"
+}
+
+# ----- Step 7/8: agent completion notifications (tmux → cmux OSC 777) -----
+# tmux swallows the notification escapes Claude Code / Codex emit themselves,
+# so agent lifecycle hooks instead call a shared helper that writes OSC 777
+# directly to every tmux client tty attached to the current session. cmux
+# (the Ghostty-based Mac terminal) renders those as desktop notifications;
+# other attached clients (e.g. Termius on iOS) silently discard the bytes.
+# Layout: one helper script + inline parsing in each agent's own config —
+# no per-agent hook scripts.
+step_cmux_notifications() {
+  echo "[7/8] Agent completion notifications (cmux)"
+
+  # (a) Shared broadcast helper. Written only if absent so dev edits survive
+  # re-runs (e.g. an uncommented ntfy push line).
+  mkdir -p "${HOME}/bin"
+  if [ -f "${HOME}/bin/tmux-osc-notify.sh" ]; then
+    echo "  ✓ ~/bin/tmux-osc-notify.sh already present"
+  else
+    cat > "${HOME}/bin/tmux-osc-notify.sh" <<'NOTIFY_HELPER_EOF'
+#!/usr/bin/env bash
+# Broadcast an OSC 777 desktop notification to every tmux client attached to
+# the CURRENT session. cmux (on the Mac) renders it; other clients (e.g.
+# Termius) silently ignore it.
+# Usage: tmux-osc-notify.sh <title> <body>
+set -u
+
+[ -n "${TMUX:-}" ] || exit 0  # no-op outside tmux, by design
+
+# Strip ALL control characters (prevents terminal-escape injection via agent
+# output — the body is written raw to the Mac terminal's pty, bypassing tmux),
+# replace OSC 777's ';' field separator, flatten, truncate.
+title=$(printf '%s' "${1:-Notification}" | tr -d '[:cntrl:]' | tr ';' ',' | head -c 80)
+body=$(printf '%s' "${2:-}" | tr -d '[:cntrl:]' | tr ';' ',' | head -c 200)
+
+session=$(tmux display-message -p '#S' 2>/dev/null) || exit 0
+
+# Scope to this session's clients only, so notifications don't light up
+# unrelated cmux workspaces attached to other sessions on the same server.
+# timeout 1 guards against a stalled client pty (e.g. a backgrounded/dead
+# Termius connection) blocking the write and hanging the hook.
+tmux list-clients -t "$session" -F '#{client_tty}' 2>/dev/null | while read -r tty; do
+  [ -n "$tty" ] && [ -w "$tty" ] && \
+    timeout 1 bash -c 'printf "\033]777;notify;%s;%s\007" "$1" "$2" > "$3"' _ "$title" "$body" "$tty" 2>/dev/null
+done
+
+# Optional phone push for when no Mac is attached (uncomment, set topic).
+# PRIVACY NOTE: ntfy.sh public topics are readable by anyone who knows the
+# topic name, and agent output transits a third party in plaintext. Use a
+# self-hosted ntfy instance or token-authenticated topics for anything
+# work-sensitive.
+# curl -s -m 5 -H "Title: $title" -d "$body" https://ntfy.sh/YOUR_TOPIC >/dev/null 2>&1 &
+
+exit 0
+NOTIFY_HELPER_EOF
+    chmod +x "${HOME}/bin/tmux-osc-notify.sh"
+    echo "  ✓ installed ~/bin/tmux-osc-notify.sh"
+  fi
+
+  # (b) Claude Code: Stop + Notification hooks with inline parsing. Merge into
+  # settings.json, never clobber; skip an event if a tmux-osc-notify hook is
+  # already registered for it. Hooks must always exit 0 — a Stop hook exiting
+  # 2 would block Claude from stopping — which `exec` of the always-exit-0
+  # helper guarantees.
+  local settings="${HOME}/.claude/settings.json"
+  mkdir -p "${HOME}/.claude"
+  [ -s "$settings" ] || echo '{}' > "$settings"
+
+  local stop_cmd notif_cmd evt cmd tmp
+  stop_cmd=$(cat <<'CLAUDE_STOP_EOF'
+b=$(jq -r '.last_assistant_message // "Done — waiting for you"'); exec "$HOME/bin/tmux-osc-notify.sh" Claude "$b"
+CLAUDE_STOP_EOF
+)
+  notif_cmd=$(cat <<'CLAUDE_NOTIF_EOF'
+b=$(jq -r '.message // "Needs your input"'); exec "$HOME/bin/tmux-osc-notify.sh" Claude "$b"
+CLAUDE_NOTIF_EOF
+)
+
+  for evt in Stop Notification; do
+    case "$evt" in
+      Stop) cmd="$stop_cmd" ;;
+      *)    cmd="$notif_cmd" ;;
+    esac
+    if jq -e --arg evt "$evt" \
+        '[.hooks[$evt][]?.hooks[]?.command // "" | contains("tmux-osc-notify")] | any' \
+        "$settings" >/dev/null; then
+      echo "  ✓ Claude $evt hook already registered"
+      continue
+    fi
+    tmp=$(mktemp)
+    jq --arg evt "$evt" --arg cmd "$cmd" \
+      '.hooks[$evt] = ((.hooks[$evt] // []) + [{"hooks":[{"type":"command","command":$cmd,"timeout":10}]}])' \
+      "$settings" > "$tmp" && mv "$tmp" "$settings"
+    echo "  ✓ registered Claude $evt hook"
+  done
+  jq . "$settings" >/dev/null \
+    || { echo "  ⚠ ~/.claude/settings.json no longer parses — fix before starting claude" >&2; return 1; }
+
+  # (c) Codex: top-level `notify` in the USER-LEVEL config only (Codex ignores
+  # project-local notify). Must sit ABOVE the first [section] header or TOML
+  # silently nests it inside that table. The '''…''' is a TOML multi-line
+  # LITERAL string (no escape processing); the trailing "_" is $0 so Codex's
+  # appended JSON payload lands as $1. Subagent completions use the same event
+  # type but omit `client`, so that field gates notifications to user-facing
+  # turns only. Harmless if Codex isn't installed yet — the config just waits
+  # for it.
+  local codex_cfg="${HOME}/.codex/config.toml" notify_line
+  notify_line=$(cat <<'CODEX_NOTIFY_EOF'
+notify = ["bash", "-c", '''[ "$(jq -r .type <<<"$1")" = agent-turn-complete ] || exit 0; [ -n "$(jq -r '.client // empty' <<<"$1")" ] || exit 0; b=$(jq -r '."last-assistant-message" // "Turn complete"' <<<"$1"); exec "$HOME/bin/tmux-osc-notify.sh" Codex "$b"''', "_"]
+CODEX_NOTIFY_EOF
+)
+  mkdir -p "${HOME}/.codex"
+  if [ -f "$codex_cfg" ] && grep -q '^notify[[:space:]]*=' "$codex_cfg"; then
+    echo "  ✓ Codex notify already configured"
+  elif [ -f "$codex_cfg" ]; then
+    tmp=$(mktemp)
+    awk -v line="$notify_line" \
+      '!done && /^\[/ {print line; print ""; done=1} {print} END {if (!done) print line}' \
+      "$codex_cfg" > "$tmp" && mv "$tmp" "$codex_cfg"
+    echo "  ✓ added Codex notify above first [section] in existing config.toml"
+  else
+    printf '%s\n' "$notify_line" > "$codex_cfg"
+    echo "  ✓ created ~/.codex/config.toml with notify"
+  fi
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import tomllib' >/dev/null 2>&1; then
+    python3 -c "import tomllib; tomllib.load(open('${HOME}/.codex/config.toml','rb'))" \
+      || { echo "  ⚠ ~/.codex/config.toml no longer parses as TOML — fix before starting codex" >&2; return 1; }
+  fi
+}
+
+# ----- Step 8/8: tmux auto-load preference -----
+step_auto_tmux() {
+  echo "[8/8] tmux auto-load on SSH"
+  local cur prompt ans
+  if [ -f "${HOME}/.auto-tmux" ]; then cur=on; prompt="[Y/n]"; else cur=off; prompt="[y/N]"; fi
+  read -r -p "  Auto-attach a persistent tmux 'main' session on every SSH, surviving drops (applies next login)? $prompt " ans
+  ans="${ans:-$([ "$cur" = on ] && echo y || echo n)}"
+  case "$ans" in
+    y|Y) touch "${HOME}/.auto-tmux"; echo "  ✓ enabled — undo anytime with: rm ~/.auto-tmux" ;;
+    *)   rm -f "${HOME}/.auto-tmux"; echo "  ✓ plain shell — enable anytime with: touch ~/.auto-tmux" ;;
+  esac
+}
+
+# ----- main -----
+main() {
+  step_github_auth
+  step_git_config
+  step_claude_auth
+  step_chrome_mcp_config
+  step_codex_mcp_config
+  step_clone_repos
+  step_cmux_notifications
+  step_auto_tmux
+
+  touch "$SENTINEL"
+  echo ""
+  echo "Done. Sentinel written: $SENTINEL"
+}
+
+main "$@"
