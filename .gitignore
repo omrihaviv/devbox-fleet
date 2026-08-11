@@ -27,6 +27,9 @@ scripts/devbox-repos.default
 # Local isolated implementation worktrees.
 .worktrees/
 
+# Local planning artifacts (specs/plans) — never publish.
+docs/superpowers/
+
 # Editor / OS junk
 .DS_Store
 *.swp
