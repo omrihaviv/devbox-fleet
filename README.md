@@ -12,16 +12,16 @@ centrally updated.
 
 ```mermaid
 flowchart LR
-    dev["Laptop / phone<br/>(Tailscale)"]
-    admin["Admin breakglass<br/>(Google IAP)"]
+    dev["Laptop / phone (Tailscale)"]
+    admin["Admin breakglass (Google IAP)"]
     subgraph gcp["GCP project"]
         subgraph vpc["VPC — inbound only WireGuard UDP 41641 + IAP-ranged SSH"]
             a["alice-devbox"]
             b["bob-devbox"]
         end
-        gcs[("runtime manifest<br/>GCS")]
+        gcs[("runtime manifest (GCS)")]
     end
-    aws["AWS Bedrock<br/>(optional, keyless federation)"]
+    aws["AWS Bedrock (optional, keyless federation)"]
     dev -->|Tailscale SSH / mosh| a
     admin -.-> a
     a -->|converge timer| gcs

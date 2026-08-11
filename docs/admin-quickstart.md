@@ -176,7 +176,7 @@ sequenceDiagram
     Canary-->>Admin: verify the box
     Admin->>GCS: promote-runtime.sh SHA (moves the pointer)
     Fleet->>GCS: converge timer picks it up (within ~9h)
-    Note over Fleet: rollback = promote the previous manifest<br/>(packages set to latest are not promotion-gated)
+    Note over Fleet: rollback = promote the previous manifest (packages set to latest are not promotion-gated)
 ```
 
 Full walkthrough: [runbook, Routine operations](admin-runbook.md#routine-operations).
