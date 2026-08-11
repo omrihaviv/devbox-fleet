@@ -306,7 +306,8 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
 
 ### Paseo installation ownership
 
-New devboxes install Paseo below `/home/dev/.local/share/paseo/npm`, owned by
+New devboxes install [Paseo](https://github.com/getpaseo/paseo) below
+`/home/dev/.local/share/paseo/npm`, owned by
 `dev`. The primary `/home/dev/.local/bin/paseo` launcher and its
 `/usr/local/bin/paseo` fallback export that directory as `NPM_CONFIG_PREFIX`, so
 Paseo's daemon self-updater can run its normal global npm update without sudo.

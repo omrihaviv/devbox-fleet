@@ -52,7 +52,8 @@ flowchart LR
 
 Claude Code · Codex CLI · Chrome + DevTools MCP (ephemeral & steerable) ·
 Docker + Compose · Node (NVM) · gh · AWS CLI · VS Code for the web · tmux +
-resurrect/continuum · mosh · Paseo · earlyoom memory guardrails
+resurrect/continuum · mosh · [Paseo](https://github.com/getpaseo/paseo) ·
+earlyoom memory guardrails
 
 ## Get started
 
