@@ -99,7 +99,7 @@ Codex stores and refreshes its OAuth credentials after you authorize access.
 
 ### Paseo
 
-Your box comes with the [Paseo](https://github.com/getpaseo/paseo) CLI preinstalled (it self-updates) and preconfigured for direct Tailscale access. Paseo runs continuously as a boot-enabled systemd service:
+Your box comes with the [Paseo](https://github.com/getpaseo/paseo) CLI preinstalled (at a fleet-pinned version — update it from the Paseo app whenever you want a newer one) and preconfigured for direct Tailscale access. Paseo runs continuously as a boot-enabled systemd service:
 
 ```bash
 paseo daemon status

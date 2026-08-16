@@ -28,6 +28,10 @@ variables {
     chrome_devtools_mcp_version = "test"
     aws_cli_version             = "test"
     aws_cli_install_sha256      = "1111111111111111111111111111111111111111111111111111111111111111"
+    claude_installer_sha256     = "2222222222222222222222222222222222222222222222222222222222222222"
+    codex_installer_sha256      = "3333333333333333333333333333333333333333333333333333333333333333"
+    paseo_cli_version           = "0.0.1"
+    paseo_cli_tarball_sha256    = "4444444444444444444444444444444444444444444444444444444444444444"
   }
 
   tailscale_admin_emails        = ["admin@example.test"]
@@ -147,6 +151,39 @@ run "reject_placeholder_download_checksums" {
       chrome_devtools_mcp_version = "test"
       aws_cli_version             = "test"
       aws_cli_install_sha256      = "REPLACE_WITH_REAL_SHA"
+      claude_installer_sha256     = "REPLACE_WITH_REAL_SHA"
+      codex_installer_sha256      = "REPLACE_WITH_REAL_SHA"
+      paseo_cli_version           = "test"
+      paseo_cli_tarball_sha256    = "REPLACE_WITH_REAL_SHA"
+    }
+  }
+
+  expect_failures = [var.toolchain]
+}
+
+# The Paseo version pin addresses an exact registry tarball, so the regex must
+# be fully anchored: a trailing suffix like "0.4.0junk" would otherwise pass
+# validation and reach the fetch URL at converge time.
+run "reject_non_exact_paseo_version" {
+  command = plan
+
+  variables {
+    toolchain = {
+      tailscale_version           = "test"
+      docker_ce_version           = "test"
+      gh_version                  = "test"
+      system_node_version         = "test"
+      nvm_version                 = "test"
+      nvm_install_sha256          = "0000000000000000000000000000000000000000000000000000000000000000"
+      node_version                = "test"
+      google_chrome_version       = "test"
+      chrome_devtools_mcp_version = "test"
+      aws_cli_version             = "test"
+      aws_cli_install_sha256      = "1111111111111111111111111111111111111111111111111111111111111111"
+      claude_installer_sha256     = "2222222222222222222222222222222222222222222222222222222222222222"
+      codex_installer_sha256      = "3333333333333333333333333333333333333333333333333333333333333333"
+      paseo_cli_version           = "0.4.0junk"
+      paseo_cli_tarball_sha256    = "4444444444444444444444444444444444444444444444444444444444444444"
     }
   }
 

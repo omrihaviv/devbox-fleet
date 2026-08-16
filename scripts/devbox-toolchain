@@ -81,6 +81,10 @@ require_env() {
     DEVBOX_CHROME_DEVTOOLS_MCP_VERSION \
     DEVBOX_AWS_CLI_VERSION \
     DEVBOX_AWS_CLI_INSTALL_SHA256 \
+    DEVBOX_CLAUDE_INSTALLER_SHA256 \
+    DEVBOX_CODEX_INSTALLER_SHA256 \
+    DEVBOX_PASEO_CLI_VERSION \
+    DEVBOX_PASEO_CLI_TARBALL_SHA256 \
     DEVBOX_TMUX_RESURRECT_COMMIT \
     DEVBOX_TMUX_CONTINUUM_COMMIT; do
     if [ -z "${!name:-}" ]; then
@@ -453,7 +457,25 @@ ensure_claude_code() {
     rm -f "$installer"
     return 1
   fi
-  if ! chown "$DEV_USER" "$installer"; then
+
+  # $CLAUDE_INSTALLER_URL floats: upstream edits install.sh in place, so a
+  # mismatch here means either a legitimate new upstream installer or a
+  # hostile one — the box cannot tell, so both fail loudly until an admin
+  # verifies the new script and bumps toolchain.claude_installer_sha256
+  # (docs/admin-runbook.md). Only boxes whose claude is already broken reach
+  # this path; healthy boxes never re-download. The check runs BEFORE the
+  # existing binary is cleared below, so a stale pin behaves exactly like a
+  # failed download and never costs a box its working claude.
+  if ! echo "$DEVBOX_CLAUDE_INSTALLER_SHA256  $installer" | sha256sum -c -; then
+    rm -f "$installer"
+    return 1
+  fi
+
+  # Root keeps ownership of the verified script through execution: 0644 lets
+  # $DEV_USER read it, while root ownership plus /tmp's sticky bit keep a
+  # dev-level process from swapping the bytes between this check and the run
+  # below. Never chown it to $DEV_USER.
+  if ! chmod 0644 "$installer"; then
     rm -f "$installer"
     return 1
   fi
@@ -479,8 +501,10 @@ ensure_claude_code() {
   # cd first: the installer runs as $DEV_USER but inherits the caller's CWD --
   # an admin converge from an SSH session sits in a home directory dev cannot
   # read (same rule as ensure_codex_cli and ensure_agent_plugins).
-  # install.sh verifies the downloaded binary against the SHA-256 in the
-  # release manifest itself, so no local sha pin is needed.
+  # install.sh checks the binary it downloads against a release manifest, but
+  # that manifest is served from the same origin — transport protection only.
+  # The org pin above is what defends this fetch; the binary itself then
+  # floats by design (Claude Code self-updates).
   if ! (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
       HOME="$DEV_HOME" \
       bash "$installer" "$CLAUDE_INSTALL_TARGET"); then
@@ -557,7 +581,17 @@ ensure_codex_cli() {
     return 1
   fi
 
-  if ! chown "$DEV_USER" "$installer"; then
+  # Same floating-URL pin trade-off as ensure_claude_code: a new upstream
+  # installer fails new-box bootstraps loudly (retry marker retained) until an
+  # admin verifies it and bumps toolchain.codex_installer_sha256.
+  if ! echo "$DEVBOX_CODEX_INSTALLER_SHA256  $installer" | sha256sum -c -; then
+    rm -f "$installer"
+    return 1
+  fi
+
+  # Same rule as ensure_claude_code: root keeps ownership of the verified
+  # script; 0644 grants dev read access without granting write access.
+  if ! chmod 0644 "$installer"; then
     rm -f "$installer"
     return 1
   fi
@@ -685,7 +719,7 @@ ensure_paseo_daemon() {
 
 ensure_paseo() {
   local config_base="" config_source config_tmp dns_name ip_octet launcher_tmp paseo_version short_name
-  local tailscale_ip tailscale_status
+  local paseo_tarball_dir tailscale_ip tailscale_status
 
   if [ -f "$PASEO_SUCCESS_FILE" ]; then
     rm -f "$PASEO_REQUIRED_FILE" || return 1
@@ -712,12 +746,42 @@ ensure_paseo() {
   if ! install -d -o "$DEV_USER" -g "$DEV_USER" -m 0755 "$PASEO_NPM_PREFIX"; then
     return 1
   fi
+
+  # Fetch the pinned tarball straight from the registry and verify it against
+  # the org pin BEFORE npm touches it — npm's own integrity metadata comes
+  # from the same origin as the tarball, so it cannot anchor this. A local
+  # tarball is still a "normal npm global install" to Paseo's install-origin
+  # check, so the dev-triggered in-app updater keeps working; this pin
+  # governs only the unattended bootstrap path. Known residual: the CLI's
+  # transitive npm dependencies still resolve from the registry at install
+  # time under npm's own integrity metadata — closing that would take a
+  # package mirror, which the fleet has deliberately not adopted.
+  paseo_tarball_dir="$(mktemp -d)" || return 1
+  if ! curl -fsSL \
+      "https://registry.npmjs.org/@getpaseo/cli/-/cli-${DEVBOX_PASEO_CLI_VERSION}.tgz" \
+      -o "$paseo_tarball_dir/paseo-cli.tgz"; then
+    rm -rf "$paseo_tarball_dir"
+    return 1
+  fi
+  if ! echo "$DEVBOX_PASEO_CLI_TARBALL_SHA256  $paseo_tarball_dir/paseo-cli.tgz" \
+      | sha256sum -c -; then
+    rm -rf "$paseo_tarball_dir"
+    return 1
+  fi
+  # npm runs as $DEV_USER; mktemp -d is 0700 root.
+  if ! chmod 0755 "$paseo_tarball_dir" \
+      || ! chmod 0644 "$paseo_tarball_dir/paseo-cli.tgz"; then
+    rm -rf "$paseo_tarball_dir"
+    return 1
+  fi
   if ! (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
       HOME="$DEV_HOME" \
       NPM_CONFIG_PREFIX="$PASEO_NPM_PREFIX" \
-      "$NPM_BIN" install -g @getpaseo/cli@latest); then
+      "$NPM_BIN" install -g "$paseo_tarball_dir/paseo-cli.tgz"); then
+    rm -rf "$paseo_tarball_dir"
     return 1
   fi
+  rm -rf "$paseo_tarball_dir"
   if [ ! -x "$PASEO_USER_BIN" ] || [ ! -d "$PASEO_PACKAGE_DIR" ]; then
     echo "paseo: npm install did not create the expected user-owned package" >&2
     return 1
@@ -746,6 +810,10 @@ ensure_paseo() {
       HOME="$DEV_HOME" \
       NPM_CONFIG_PREFIX="$PASEO_NPM_PREFIX" \
       "$PASEO_BIN" --version)"; then
+    return 1
+  fi
+  if [ "$paseo_version" != "$DEVBOX_PASEO_CLI_VERSION" ]; then
+    echo "paseo: installed version $paseo_version does not match the pinned $DEVBOX_PASEO_CLI_VERSION" >&2
     return 1
   fi
 
@@ -1040,10 +1108,12 @@ ensure_agent_plugins() {
         https://github.com/openai/codex-plugin-cc.git --scope user
     sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
       "$CLAUDE_BIN" plugin install codex@openai-codex --scope user
+    # openai-curated is Codex's preconfigured official marketplace
+    # (github.com/openai/plugins), which carries superpowers — no
+    # `plugin marketplace add`, and never the author's personal repo
+    # (obra/superpowers): every source here must be a vendor-org channel.
     sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
-      "$CODEX_BIN" plugin marketplace add https://github.com/obra/superpowers.git
-    sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
-      "$CODEX_BIN" plugin add superpowers@superpowers-dev
+      "$CODEX_BIN" plugin add superpowers@openai-curated
   )
 
   printf 'installed=%s\n' "$(date -u --iso-8601=seconds)" \

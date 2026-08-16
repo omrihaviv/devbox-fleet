@@ -25,6 +25,20 @@ toolchain = {
   aws_cli_version             = "2.34.53"
   # sha256 of awscli-exe-linux-x86_64-2.34.53.zip from awscli.amazonaws.com
   aws_cli_install_sha256      = "b06c9865123cf1bc6f8761a0bf3161630e6f55d84363f9fda89535e2cdbe654b"
+  # sha256 of https://claude.ai/install.sh and https://chatgpt.com/codex/install.sh.
+  # These URLs FLOAT (upstream edits them in place): recompute both at deploy
+  # time and re-verify + bump whenever a converge reports a pin mismatch —
+  #   curl -fsSL https://claude.ai/install.sh | sha256sum
+  #   curl -fsSL https://chatgpt.com/codex/install.sh | sha256sum
+  # Values below were current on 2026-08-16.
+  claude_installer_sha256     = "cde4f1702d3b1695f92b73d26888364e17bca476e17f0fd676484c951d36c125"
+  codex_installer_sha256      = "ba92dd27e5c06f0d3bbc58bfa4b9cfb6599cd2742fbb1f92a2765e6c07dedb5a"
+  # Exact @getpaseo/cli version + sha256 of its registry tarball (immutable
+  # per version):
+  #   npm view @getpaseo/cli version
+  #   curl -fsSL https://registry.npmjs.org/@getpaseo/cli/-/cli-<version>.tgz | sha256sum
+  paseo_cli_version           = "0.4.0"
+  paseo_cli_tarball_sha256    = "1cdba71bc5d245f6ad486c8f3e1c745fb75020c6d7f907883d78714a820ea190"
   # Optional; default to pinned upstream commits (see gcp/variables.tf).
   # tmux_resurrect_commit     = "cff343cf9e81983d3da0c8562b01616f12e8d548"
   # tmux_continuum_commit     = "0698e8f4b17d6454c71bf5212895ec055c578da0"

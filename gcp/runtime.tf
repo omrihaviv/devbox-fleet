@@ -39,6 +39,10 @@ locals {
     DEVBOX_VSCODE_VERSION              = var.toolchain.vscode_version
     DEVBOX_AWS_CLI_VERSION             = var.toolchain.aws_cli_version
     DEVBOX_AWS_CLI_INSTALL_SHA256      = var.toolchain.aws_cli_install_sha256
+    DEVBOX_CLAUDE_INSTALLER_SHA256     = var.toolchain.claude_installer_sha256
+    DEVBOX_CODEX_INSTALLER_SHA256      = var.toolchain.codex_installer_sha256
+    DEVBOX_PASEO_CLI_VERSION           = var.toolchain.paseo_cli_version
+    DEVBOX_PASEO_CLI_TARBALL_SHA256    = var.toolchain.paseo_cli_tarball_sha256
     DEVBOX_TMUX_RESURRECT_COMMIT       = var.toolchain.tmux_resurrect_commit
     DEVBOX_TMUX_CONTINUUM_COMMIT       = var.toolchain.tmux_continuum_commit
     DEVBOX_CODEX_MCP_CONNECTORS        = jsonencode(var.codex_mcp_connectors)

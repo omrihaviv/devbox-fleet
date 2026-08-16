@@ -80,19 +80,31 @@ EOF
   cat > "$fake_bin/curl" <<'EOF'
 #!/usr/bin/env bash
 out=""
+url=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o)
       out="$2"
       shift 2
       ;;
+    -*)
+      shift
+      ;;
     *)
+      url="$1"
       shift
       ;;
   esac
 done
 [ -n "$out" ] || exit 2
-if [ -n "${DEVBOX_TEST_CODEX_INSTALLER_SOURCE:-}" ]; then
+if [ -n "${DEVBOX_TEST_PASEO_TARBALL_SOURCE:-}" ] \
+    && [[ "$url" == *"registry.npmjs.org/@getpaseo/cli"* ]]; then
+  echo "download $url $out" >> "$DEVBOX_TEST_PASEO_DOWNLOAD_LOG"
+  if [ "${DEVBOX_TEST_PASEO_DOWNLOAD_FAIL:-0}" = 1 ]; then
+    exit 44
+  fi
+  cp "$DEVBOX_TEST_PASEO_TARBALL_SOURCE" "$out"
+elif [ -n "${DEVBOX_TEST_CODEX_INSTALLER_SOURCE:-}" ]; then
   echo "download $out" >> "$DEVBOX_TEST_CODEX_DOWNLOAD_LOG"
   if [ "${DEVBOX_TEST_CODEX_DOWNLOAD_FAIL:-0}" = 1 ]; then
     exit 44
@@ -145,14 +157,23 @@ echo "mount $*" >> "$DEVBOX_TEST_LOG"
 EOF
   cat > "$fake_bin/chown" <<'EOF'
 #!/usr/bin/env bash
+# Tripwire log: the sudo fake rejects any run whose installer was chowned to
+# the dev user, so a reintroduced ownership transfer fails loudly.
 if [ -n "${DEVBOX_TEST_CODEX_CHOWN_LOG:-}" ] && [ "${1:-}" = "${DEV_USER:-}" ]; then
   echo "chown $*" >> "$DEVBOX_TEST_CODEX_CHOWN_LOG"
-  if [ "${DEVBOX_TEST_CODEX_CHOWN_FAIL:-0}" = 1 ]; then
-    exit 43
-  fi
 else
   echo "chown $*" >> "$DEVBOX_TEST_LOG"
 fi
+EOF
+  cat > "$fake_bin/chmod" <<'EOF'
+#!/usr/bin/env bash
+if [ -n "${DEVBOX_TEST_CODEX_CHMOD_LOG:-}" ] && [ "${1:-}" = 0644 ]; then
+  echo "chmod $*" >> "$DEVBOX_TEST_CODEX_CHMOD_LOG"
+  if [ "${DEVBOX_TEST_CODEX_CHMOD_FAIL:-0}" = 1 ]; then
+    exit 43
+  fi
+fi
+/usr/bin/chmod "$@"
 EOF
   cat > "$fake_bin/mv" <<'EOF'
 #!/usr/bin/env bash
@@ -193,13 +214,16 @@ case "$*" in
     ;;
   *"CODEX_NON_INTERACTIVE=1"*)
     installer="${@: -1}"
-    if [ ! -f "$DEVBOX_TEST_CODEX_CHOWN_LOG" ] \
-        || ! grep -qxF "chown $DEV_USER $installer" "$DEVBOX_TEST_CODEX_CHOWN_LOG"; then
-      echo "Codex installer ownership was not transferred for $installer" >&2
+    # The verified script must stay owned by the converge user (root in
+    # production): a chown to $DEV_USER would hand the dev write access
+    # between verification and execution.
+    if [ -f "$DEVBOX_TEST_CODEX_CHOWN_LOG" ] \
+        && grep -q "^chown $DEV_USER " "$DEVBOX_TEST_CODEX_CHOWN_LOG"; then
+      echo "Codex installer ownership was transferred to the dev user: $installer" >&2
       exit 1
     fi
-    if [ "$(stat -c '%a' "$installer")" != 600 ]; then
-      echo "Codex installer permissions are not restrictive for $installer" >&2
+    if [ "$(stat -c '%a' "$installer")" != 644 ]; then
+      echo "Codex installer is not read-only for dev (0644): $installer" >&2
       exit 1
     fi
     while [ "$#" -gt 0 ]; do
@@ -229,7 +253,7 @@ case "$*" in
     fi
     "$6" "$7"
     ;;
-  *"${NPM_BIN:-/__unset_npm__} install -g @getpaseo/cli@latest"*)
+  *"${NPM_BIN:-/__unset_npm__} install -g "*"/paseo-cli.tgz"*)
     if [ "$#" -ne 10 ] \
         || [ "$1" != -u ] \
         || [ "$2" != "$DEV_USER" ] \
@@ -239,11 +263,17 @@ case "$*" in
         || [ "$6" != "NPM_CONFIG_PREFIX=$PASEO_NPM_PREFIX" ] \
         || [ "$7" != "$NPM_BIN" ] \
         || [ "$8" != install ] \
-        || [ "$9" != -g ] \
-        || [ "${10}" != @getpaseo/cli@latest ]; then
+        || [ "$9" != -g ]; then
       echo "Paseo install did not use the expected dev-user prefix boundary: $*" >&2
       exit 1
     fi
+    case "${10}" in
+      */paseo-cli.tgz) ;;
+      *)
+        echo "Paseo install target is not the verified local tarball: ${10}" >&2
+        exit 1
+        ;;
+    esac
     echo "install $*" >> "$DEVBOX_TEST_PASEO_INSTALL_BOUNDARY_LOG"
     shift 3
     "$@"
@@ -361,6 +391,16 @@ case "$*" in
       echo "Claude installer did not use the expected dev-user boundary: $*" >&2
       exit 1
     fi
+    # Same rule as the Codex branch: the verified script must stay owned by
+    # the converge user and read-only for dev through execution.
+    if [ -f "${DEVBOX_TEST_LOG:-}" ] && grep -q "^chown $DEV_USER " "$DEVBOX_TEST_LOG"; then
+      echo "Claude installer ownership was transferred to the dev user: $7" >&2
+      exit 1
+    fi
+    if [ "$(stat -c '%a' "$7")" != 644 ]; then
+      echo "Claude installer is not read-only for dev (0644): $7" >&2
+      exit 1
+    fi
     if [ "$PWD" != "$DEV_HOME" ]; then
       echo "Claude installer did not start from the dev home: cwd=$PWD expected=$DEV_HOME" >&2
       exit 1
@@ -388,7 +428,11 @@ EOF
   cat > "$fake_bin/npm" <<'EOF'
 #!/usr/bin/env bash
 echo "npm $*" >> "$DEVBOX_TEST_LOG"
-if [ "$*" = "install -g @getpaseo/cli@latest" ]; then
+case "$*" in "install -g "*"/paseo-cli.tgz")
+  if [ ! -f "$3" ]; then
+    echo "Paseo npm install target tarball is missing: $3" >&2
+    exit 59
+  fi
   if [ "${NPM_CONFIG_PREFIX:-}" != "$PASEO_NPM_PREFIX" ]; then
     echo "Paseo npm install used prefix '${NPM_CONFIG_PREFIX:-unset}', expected '$PASEO_NPM_PREFIX'" >&2
     exit 57
@@ -408,7 +452,7 @@ exit 53
 PASEO_EOF
   chmod 0755 "$PASEO_USER_BIN"
   /usr/bin/chown -R "$DEV_USER:$DEV_USER" "$PASEO_NPM_PREFIX"
-fi
+esac
 EOF
   cat > "$fake_bin/aws" <<'EOF'
 #!/usr/bin/env bash
@@ -592,9 +636,13 @@ run_codex_step() {
   local function_file="$workdir/ensure-codex.sh"
 
   extract_codex_step "$function_file"
-  DEVBOX_TEST_LOG="$workdir/install.log" \
+  # The pin defaults to the fixture installer's real sha; a test overrides
+  # DEVBOX_CODEX_INSTALLER_SHA256 to exercise the mismatch path.
+  DEVBOX_CODEX_INSTALLER_SHA256="${DEVBOX_CODEX_INSTALLER_SHA256:-$(sha256sum "$workdir/install.sh" | cut -d' ' -f1)}" \
+    DEVBOX_TEST_LOG="$workdir/install.log" \
     DEVBOX_TEST_CODEX_CHOWN_LOG="$workdir/chown.log" \
-    DEVBOX_TEST_CODEX_CHOWN_FAIL="${DEVBOX_TEST_CODEX_CHOWN_FAIL:-0}" \
+    DEVBOX_TEST_CODEX_CHMOD_LOG="$workdir/chmod.log" \
+    DEVBOX_TEST_CODEX_CHMOD_FAIL="${DEVBOX_TEST_CODEX_CHMOD_FAIL:-0}" \
     DEVBOX_TEST_CODEX_DOWNLOAD_LOG="$workdir/download.log" \
     DEVBOX_TEST_CODEX_DOWNLOAD_FAIL="${DEVBOX_TEST_CODEX_DOWNLOAD_FAIL:-0}" \
     DEVBOX_TEST_CODEX_INSTALLER_SOURCE="$workdir/install.sh" \
@@ -621,7 +669,16 @@ run_paseo_step() {
   local function_file="$workdir/ensure-paseo.sh"
 
   extract_paseo_step "$function_file"
-  DEVBOX_TEST_LOG="$workdir/commands.log" \
+  # Fixture registry tarball; the sha pin defaults to its real sha and the
+  # version pin matches the fake npm's installed paseo. Tests override either
+  # env to exercise the mismatch paths.
+  printf 'fake @getpaseo/cli tarball\n' > "$workdir/paseo-cli.tgz"
+  DEVBOX_PASEO_CLI_VERSION="${DEVBOX_PASEO_CLI_VERSION:-0.1.107}" \
+    DEVBOX_PASEO_CLI_TARBALL_SHA256="${DEVBOX_PASEO_CLI_TARBALL_SHA256:-$(sha256sum "$workdir/paseo-cli.tgz" | cut -d' ' -f1)}" \
+    DEVBOX_TEST_PASEO_TARBALL_SOURCE="$workdir/paseo-cli.tgz" \
+    DEVBOX_TEST_PASEO_DOWNLOAD_LOG="$workdir/paseo-download.log" \
+    DEVBOX_TEST_PASEO_DOWNLOAD_FAIL="${DEVBOX_TEST_PASEO_DOWNLOAD_FAIL:-0}" \
+    DEVBOX_TEST_LOG="$workdir/commands.log" \
     DEVBOX_TEST_PASEO_INSTALL_FAIL="${DEVBOX_TEST_PASEO_INSTALL_FAIL:-0}" \
     DEVBOX_TEST_PASEO_RUNTIME_LOG="$workdir/paseo-runtime.log" \
     DEVBOX_TEST_PASEO_TAILSCALE_LOG="$workdir/tailscale.log" \
@@ -843,6 +900,10 @@ test_matching_versions_are_noop() {
     DEVBOX_CHROME_DEVTOOLS_MCP_VERSION="1.0.0" \
     DEVBOX_AWS_CLI_VERSION="2.0.0" \
     DEVBOX_AWS_CLI_INSTALL_SHA256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+    DEVBOX_CLAUDE_INSTALLER_SHA256="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" \
+    DEVBOX_CODEX_INSTALLER_SHA256="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+    DEVBOX_PASEO_CLI_VERSION="0.1.107" \
+    DEVBOX_PASEO_CLI_TARBALL_SHA256="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" \
     DEVBOX_TMUX_PLUGINS_DIR="$workdir/opt/tmux-plugins" \
     DEVBOX_TMUX_CONF_FILE="$workdir/home/.tmux.conf" \
     DEVBOX_TMUX_BIN="$workdir/fake-bin/tmux" \
@@ -944,6 +1005,10 @@ test_containerd_migration() {
     DEVBOX_CHROME_DEVTOOLS_MCP_VERSION="1.0.0" \
     DEVBOX_AWS_CLI_VERSION="2.0.0" \
     DEVBOX_AWS_CLI_INSTALL_SHA256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+    DEVBOX_CLAUDE_INSTALLER_SHA256="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" \
+    DEVBOX_CODEX_INSTALLER_SHA256="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+    DEVBOX_PASEO_CLI_VERSION="0.1.107" \
+    DEVBOX_PASEO_CLI_TARBALL_SHA256="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" \
     DEVBOX_TMUX_PLUGINS_DIR="$workdir/opt/tmux-plugins" \
     DEVBOX_TMUX_CONF_FILE="$workdir/home/.tmux.conf" \
     DEVBOX_TMUX_BIN="$workdir/fake-bin/tmux" \
@@ -980,7 +1045,7 @@ test_agent_plugins_new_gcp_bootstrap_and_post_success_noop() {
   run_agent_plugins_step "$workdir"
 
   mapfile -t commands < "$workdir/plugin.log"
-  [ "${#commands[@]}" -eq 6 ] || fail "new GCP bootstrap did not run all six plugin commands"
+  [ "${#commands[@]}" -eq 5 ] || fail "new GCP bootstrap did not run all five plugin commands"
   [ "${commands[0]}" = "claude plugin marketplace add https://github.com/anthropics/claude-plugins-official.git --scope user" ] \
     || fail "Claude official marketplace was not added at user scope"
   [ "${commands[1]}" = "claude plugin install superpowers@claude-plugins-official --scope user" ] \
@@ -989,10 +1054,11 @@ test_agent_plugins_new_gcp_bootstrap_and_post_success_noop() {
     || fail "OpenAI Codex marketplace was not added to Claude Code"
   [ "${commands[3]}" = "claude plugin install codex@openai-codex --scope user" ] \
     || fail "Codex plugin was not installed for Claude Code"
-  [ "${commands[4]}" = "codex plugin marketplace add https://github.com/obra/superpowers.git" ] \
-    || fail "upstream Superpowers marketplace was not added to Codex"
-  [ "${commands[5]}" = "codex plugin add superpowers@superpowers-dev" ] \
-    || fail "Superpowers was not installed for Codex"
+  [ "${commands[4]}" = "codex plugin add superpowers@openai-curated" ] \
+    || fail "Superpowers was not installed for Codex from the preconfigured official marketplace"
+  if grep -q 'obra/superpowers' "$workdir/plugin.log"; then
+    fail "Codex Superpowers must come from openai-curated, not a personal marketplace clone"
+  fi
   [ ! -e "$workdir/var/lib/devbox-runtime/agent-plugins-required" ] \
     || fail "successful plugin install did not clear retry marker"
   [ -e "$workdir/var/lib/devbox-runtime/agent-plugins-installed" ] \
@@ -1001,7 +1067,7 @@ test_agent_plugins_new_gcp_bootstrap_and_post_success_noop() {
   mkdir -p "$workdir/var/lib/devbox-bootstrap"
   : > "$workdir/var/lib/devbox-bootstrap/complete"
   run_agent_plugins_step "$workdir"
-  [ "$(wc -l < "$workdir/plugin.log")" -eq 6 ] \
+  [ "$(wc -l < "$workdir/plugin.log")" -eq 5 ] \
     || fail "plugin commands reran after successful provisioning"
 }
 
@@ -1064,7 +1130,7 @@ test_agent_plugins_wait_for_codex_and_retry_after_bootstrap() {
   mkdir -p "$workdir/var/lib/devbox-bootstrap"
   : > "$workdir/var/lib/devbox-bootstrap/complete"
   run_agent_plugins_step "$workdir"
-  [ "$(wc -l < "$workdir/plugin.log")" -eq 10 ] \
+  [ "$(wc -l < "$workdir/plugin.log")" -eq 9 ] \
     || fail "plugin provisioning did not stop at failure and retry all idempotent commands"
   [ ! -e "$workdir/var/lib/devbox-runtime/agent-plugins-required" ] \
     || fail "successful plugin retry did not clear retry marker"
@@ -1193,8 +1259,8 @@ test_codex_failure_marker_retries_after_bootstrap() {
     || fail "failed Codex install did not retain retry marker"
   [ ! -e "$workdir/var/lib/devbox-runtime/codex-cli-installed" ] \
     || fail "failed Codex install created a false success marker"
-  installer="$(awk -v u="$test_user" '$1 == "chown" && $2 == u { print $3; exit }' "$workdir/chown.log")"
-  [ -n "$installer" ] || fail "failed Codex install did not reach ownership transfer"
+  installer="$(awk '$1 == "download" { print $2; exit }' "$workdir/download.log")"
+  [ -n "$installer" ] || fail "failed Codex install did not record its temporary file"
   [ ! -e "$installer" ] || fail "failed Codex install leaked its temporary file"
 
   mkdir -p "$workdir/var/lib/devbox-bootstrap"
@@ -1207,7 +1273,7 @@ test_codex_failure_marker_retries_after_bootstrap() {
     || fail "Codex retry did not run exactly once after the initial failure"
 }
 
-test_codex_ownership_failure_keeps_marker_and_cleans_installer() {
+test_codex_chmod_failure_keeps_marker_and_cleans_installer() {
   local installer
   local workdir
   workdir="$(mktemp -d)"
@@ -1218,19 +1284,19 @@ test_codex_ownership_failure_keeps_marker_and_cleans_installer() {
   mkdir -p "$workdir/home" "$workdir/etc/devbox"
   : > "$workdir/etc/devbox/runtime-bucket"
 
-  if DEVBOX_TEST_CODEX_CHOWN_FAIL=1 run_codex_step "$workdir"; then
-    fail "failed Codex installer ownership transfer unexpectedly succeeded"
+  if DEVBOX_TEST_CODEX_CHMOD_FAIL=1 run_codex_step "$workdir"; then
+    fail "failed Codex installer chmod unexpectedly succeeded"
   fi
   [ -e "$workdir/var/lib/devbox-runtime/codex-cli-required" ] \
-    || fail "failed Codex installer ownership transfer did not retain retry marker"
+    || fail "failed Codex installer chmod did not retain retry marker"
   [ ! -e "$workdir/var/lib/devbox-runtime/codex-cli-installed" ] \
-    || fail "failed Codex installer ownership transfer created a false success marker"
+    || fail "failed Codex installer chmod created a false success marker"
   [ ! -e "$workdir/install.log" ] \
-    || fail "Codex installer ran after ownership transfer failed"
+    || fail "Codex installer ran after chmod failed"
 
-  installer="$(awk -v u="$test_user" '$1 == "chown" && $2 == u { print $3 }' "$workdir/chown.log")"
-  [ -n "$installer" ] || fail "Codex installer ownership transfer was not attempted"
-  [ ! -e "$installer" ] || fail "failed Codex installer ownership transfer leaked its temporary file"
+  installer="$(awk '$1 == "chmod" { print $3 }' "$workdir/chmod.log")"
+  [ -n "$installer" ] || fail "Codex installer chmod was not attempted"
+  [ ! -e "$installer" ] || fail "failed Codex installer chmod leaked its temporary file"
 }
 
 test_codex_success_tombstone_prevents_rearm() {
@@ -1283,6 +1349,37 @@ test_codex_download_failure_keeps_marker_and_cleans_installer() {
   [ ! -e "$installer" ] || fail "failed Codex installer download leaked its temporary file"
 }
 
+test_codex_installer_sha_mismatch_keeps_marker_and_cleans_installer() {
+  local installer
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+
+  make_fake_bin "$workdir/fake-bin"
+  make_fake_codex_installer "$workdir/install.sh"
+  mkdir -p "$workdir/home" "$workdir/etc/devbox"
+  : > "$workdir/etc/devbox/runtime-bucket"
+
+  if DEVBOX_CODEX_INSTALLER_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+      run_codex_step "$workdir" >/dev/null 2>&1; then
+    fail "Codex install succeeded despite an installer pin mismatch"
+  fi
+  [ -e "$workdir/var/lib/devbox-runtime/codex-cli-required" ] \
+    || fail "Codex installer pin mismatch did not retain retry marker"
+  [ ! -e "$workdir/var/lib/devbox-runtime/codex-cli-installed" ] \
+    || fail "Codex installer pin mismatch created a false success marker"
+  [ ! -e "$workdir/install.log" ] \
+    || fail "an unverified Codex installer was executed"
+  [ ! -e "$workdir/chmod.log" ] \
+    || fail "an unverified Codex installer was made dev-readable"
+  [ ! -e "$workdir/home/.local/bin/codex" ] \
+    || fail "Codex installer pin mismatch produced a command"
+
+  installer="$(awk '$1 == "download" { print $2; exit }' "$workdir/download.log")"
+  [ -n "$installer" ] || fail "Codex installer pin mismatch did not record its temporary file"
+  [ ! -e "$installer" ] || fail "Codex installer pin mismatch leaked the unverified installer"
+}
+
 test_codex_verification_failure_keeps_marker_and_cleans_installer() {
   local installer
   local workdir
@@ -1309,7 +1406,7 @@ test_codex_verification_failure_keeps_marker_and_cleans_installer() {
     fail "failed Codex verification did not cross the dev-user boundary"
   fi
 
-  installer="$(awk -v u="$test_user" '$1 == "chown" && $2 == u { print $3; exit }' "$workdir/chown.log")"
+  installer="$(awk '$1 == "download" { print $2; exit }' "$workdir/download.log")"
   [ -n "$installer" ] || fail "failed Codex verification did not record its temporary installer"
   [ ! -e "$installer" ] || fail "failed Codex command verification leaked its temporary installer"
 }
@@ -1575,7 +1672,7 @@ test_vscode_launcher_stops_when_tailscale_serve_fails() {
   fi
 }
 
-test_paseo_new_gcp_bootstrap_installs_latest_and_writes_tailnet_config() {
+test_paseo_new_gcp_bootstrap_installs_pinned_tarball_and_writes_tailnet_config() {
   local workdir
   workdir="$(mktemp -d)"
   trap 'rm -rf "$workdir"' RETURN
@@ -1586,10 +1683,13 @@ test_paseo_new_gcp_bootstrap_installs_latest_and_writes_tailnet_config() {
 
   run_paseo_step "$workdir"
 
-  grep -qxF 'npm install -g @getpaseo/cli@latest' "$workdir/commands.log" \
-    || fail "new GCP bootstrap did not install Paseo from npm latest"
-  grep -qxF \
-    "install -u $test_user -H env HOME=$workdir/home NPM_CONFIG_PREFIX=$workdir/home/.local/share/paseo/npm $workdir/fake-bin/npm install -g @getpaseo/cli@latest" \
+  grep -q '^download https://registry.npmjs.org/@getpaseo/cli/-/cli-0.1.107.tgz ' \
+    "$workdir/paseo-download.log" \
+    || fail "new GCP bootstrap did not fetch the pinned Paseo tarball from the registry"
+  grep -Eq '^npm install -g [^ ]+/paseo-cli\.tgz$' "$workdir/commands.log" \
+    || fail "new GCP bootstrap did not install Paseo from the verified local tarball"
+  grep -Eq \
+    "^install -u $test_user -H env HOME=$workdir/home NPM_CONFIG_PREFIX=$workdir/home/.local/share/paseo/npm $workdir/fake-bin/npm install -g [^ ]+/paseo-cli\.tgz$" \
     "$workdir/paseo-install-boundary.log" \
     || fail "Paseo npm install did not cross the dev-user prefix boundary"
   grep -qxF \
@@ -1675,6 +1775,71 @@ test_paseo_new_gcp_bootstrap_installs_latest_and_writes_tailnet_config() {
     || fail "Paseo home directory is not owned by dev"
   [ "$(stat -c '%U:%G' "$workdir/home/.paseo/config.json")" = "$test_user:$test_user" ] \
     || fail "Paseo config is not owned by dev"
+}
+
+test_paseo_tarball_download_failure_retains_retry_marker() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+
+  make_fake_bin "$workdir/fake-bin"
+  mkdir -p "$workdir/home" "$workdir/etc/devbox"
+  : > "$workdir/etc/devbox/runtime-bucket"
+
+  if DEVBOX_TEST_PASEO_DOWNLOAD_FAIL=1 run_paseo_step "$workdir" >/dev/null 2>&1; then
+    fail "failed Paseo tarball download unexpectedly succeeded"
+  fi
+  [ -e "$workdir/var/lib/devbox-runtime/paseo-required" ] \
+    || fail "failed Paseo tarball download did not retain retry marker"
+  [ ! -e "$workdir/var/lib/devbox-runtime/paseo-installed" ] \
+    || fail "failed Paseo tarball download created a false success marker"
+  if [ -f "$workdir/commands.log" ] && grep -q 'npm install' "$workdir/commands.log"; then
+    fail "npm install ran despite a failed Paseo tarball download"
+  fi
+}
+
+test_paseo_tarball_sha_mismatch_retains_retry_marker() {
+  local tarball workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+
+  make_fake_bin "$workdir/fake-bin"
+  mkdir -p "$workdir/home" "$workdir/etc/devbox"
+  : > "$workdir/etc/devbox/runtime-bucket"
+
+  if DEVBOX_PASEO_CLI_TARBALL_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+      run_paseo_step "$workdir" >/dev/null 2>&1; then
+    fail "Paseo install succeeded despite a tarball pin mismatch"
+  fi
+  [ -e "$workdir/var/lib/devbox-runtime/paseo-required" ] \
+    || fail "Paseo tarball pin mismatch did not retain retry marker"
+  [ ! -e "$workdir/var/lib/devbox-runtime/paseo-installed" ] \
+    || fail "Paseo tarball pin mismatch created a false success marker"
+  if [ -f "$workdir/commands.log" ] && grep -q 'npm install' "$workdir/commands.log"; then
+    fail "npm touched an unverified Paseo tarball"
+  fi
+  tarball="$(awk '$1 == "download" { print $3; exit }' "$workdir/paseo-download.log")"
+  [ -n "$tarball" ] || fail "Paseo tarball pin mismatch did not record the downloaded file"
+  [ ! -e "$tarball" ] || fail "Paseo tarball pin mismatch leaked the unverified tarball"
+}
+
+test_paseo_pinned_version_mismatch_retains_retry_marker() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+
+  make_fake_bin "$workdir/fake-bin"
+  mkdir -p "$workdir/home" "$workdir/etc/devbox"
+  : > "$workdir/etc/devbox/runtime-bucket"
+
+  # The fake npm installs a paseo reporting 0.1.107; pin a different version.
+  if DEVBOX_PASEO_CLI_VERSION=9.9.9 run_paseo_step "$workdir" >/dev/null 2>&1; then
+    fail "Paseo install succeeded despite reporting a version other than the pin"
+  fi
+  [ -e "$workdir/var/lib/devbox-runtime/paseo-required" ] \
+    || fail "Paseo version mismatch did not retain retry marker"
+  [ ! -e "$workdir/var/lib/devbox-runtime/paseo-installed" ] \
+    || fail "Paseo version mismatch created a false success marker"
 }
 
 test_paseo_success_reconciles_boot_enabled_daemon() {
@@ -1921,8 +2086,8 @@ test_paseo_failure_marker_retries_after_bootstrap() {
   run_paseo_step "$workdir"
   [ -e "$workdir/var/lib/devbox-runtime/paseo-installed" ] \
     || fail "Paseo retry after bootstrap did not create a success marker"
-  [ "$(grep -cF 'npm install -g @getpaseo/cli@latest' "$workdir/commands.log")" -eq 2 ] \
-    || fail "Paseo retry did not resolve npm latest again"
+  [ "$(grep -cE '^npm install -g [^ ]+/paseo-cli\.tgz$' "$workdir/commands.log")" -eq 2 ] \
+    || fail "Paseo retry did not install the pinned tarball again"
 }
 
 test_paseo_tailscale_failure_retains_retry_marker() {
@@ -2024,7 +2189,7 @@ EOF
     || fail "Paseo config merge lost unmanaged settings or retained unsafe settings"
 
   run_paseo_step "$workdir"
-  [ "$(grep -cF 'npm install -g @getpaseo/cli@latest' "$workdir/commands.log")" -eq 1 ] \
+  [ "$(grep -cE '^npm install -g [^ ]+/paseo-cli\.tgz$' "$workdir/commands.log")" -eq 1 ] \
     || fail "successful Paseo provisioning upgraded during later convergence"
   [ "$(wc -l < "$workdir/paseo-verify.log")" -eq 1 ] \
     || fail "successful Paseo provisioning reverified during later convergence"
@@ -2373,7 +2538,10 @@ run_claude_step() {
   mkdir -p "$workdir/home"
   extract_claude_step "$function_file"
   make_fake_claude_installer "$workdir/claude-install.sh"
+  # The pin defaults to the fixture installer's real sha; a test overrides
+  # DEVBOX_CLAUDE_INSTALLER_SHA256 to exercise the mismatch path.
   env \
+    DEVBOX_CLAUDE_INSTALLER_SHA256="${DEVBOX_CLAUDE_INSTALLER_SHA256:-$(sha256sum "$workdir/claude-install.sh" | cut -d' ' -f1)}" \
     DEVBOX_TEST_LOG="$workdir/install.log" \
     DEVBOX_TEST_CODEX_INSTALLER_SOURCE="$workdir/claude-install.sh" \
     DEVBOX_TEST_CODEX_DOWNLOAD_LOG="$workdir/download.log" \
@@ -2542,6 +2710,34 @@ test_claude_download_failure_preserves_existing_binary() {
     || fail "pre-existing claude binary was removed before a replacement was known to be fetchable"
 }
 
+# The sha check must run BEFORE the existing $CLAUDE_BIN is cleared: a pin
+# mismatch (upstream shipped a new installer, or the origin is serving
+# something else) must behave exactly like a failed download — loud failure,
+# no marker, and whatever claude the box still has stays in place.
+test_claude_installer_sha_mismatch_preserves_existing_binary() {
+  local installer workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  make_fake_bin "$workdir/fake-bin"
+  make_stub_claude "$workdir/home/.local/bin/claude" fail
+
+  if DEVBOX_CLAUDE_INSTALLER_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+      run_claude_step "$workdir" >/dev/null 2>&1; then
+    fail "ensure_claude_code succeeded despite an installer pin mismatch"
+  fi
+  [ ! -f "$workdir/var/lib/devbox-runtime/claude-code-installed" ] \
+    || fail "marker written despite an installer pin mismatch"
+  if [ -f "$workdir/install.log" ] && grep -q 'claude-install target=' "$workdir/install.log"; then
+    fail "an unverified Claude installer was executed"
+  fi
+  [ -e "$workdir/home/.local/bin/claude" ] \
+    || fail "pre-existing claude binary was removed on an installer pin mismatch"
+
+  installer="$(awk '$1 == "download" { print $2; exit }' "$workdir/download.log")"
+  [ -n "$installer" ] || fail "Claude installer pin mismatch did not record its temporary file"
+  [ ! -e "$installer" ] || fail "Claude installer pin mismatch leaked the unverified installer"
+}
+
 seed_legacy_claude_installs() {
   local workdir="$1"
   mkdir -p "$workdir/usr/bin" \
@@ -2638,7 +2834,35 @@ test_codex_connectors_file() {
   echo "PASS codex connectors file"
 }
 
-test_paseo_new_gcp_bootstrap_installs_latest_and_writes_tailnet_config
+# The pins only defend the fetches if a manifest that lacks them cannot
+# converge at all: require_env must fail closed, before any tool runs.
+test_require_env_fails_closed_without_the_pin_env() {
+  local out workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  make_fake_bin "$workdir/fake-bin"
+
+  if out="$(env -i PATH="$workdir/fake-bin:/usr/bin:/bin" \
+      bash "$repo_root/scripts/devbox-toolchain" 2>&1)"; then
+    fail "devbox-toolchain ran without its required pin environment"
+  fi
+  grep -q 'missing required toolchain environment variables' <<<"$out" \
+    || fail "empty environment did not fail closed in require_env"
+  local name
+  for name in \
+      DEVBOX_CLAUDE_INSTALLER_SHA256 \
+      DEVBOX_CODEX_INSTALLER_SHA256 \
+      DEVBOX_PASEO_CLI_VERSION \
+      DEVBOX_PASEO_CLI_TARBALL_SHA256; do
+    grep -q "$name" <<<"$out" || fail "require_env does not require $name"
+  done
+}
+
+test_require_env_fails_closed_without_the_pin_env
+test_paseo_new_gcp_bootstrap_installs_pinned_tarball_and_writes_tailnet_config
+test_paseo_tarball_download_failure_retains_retry_marker
+test_paseo_tarball_sha_mismatch_retains_retry_marker
+test_paseo_pinned_version_mismatch_retains_retry_marker
 test_paseo_success_reconciles_boot_enabled_daemon
 test_paseo_daemon_runner_preserves_then_takes_over_detached_daemon
 test_paseo_daemon_reload_failure_is_retryable
@@ -2653,9 +2877,10 @@ test_paseo_atomic_state_failure_retains_retry_marker
 test_codex_new_gcp_bootstrap_and_post_success_noop
 test_codex_skips_existing_gcp_and_aws
 test_codex_failure_marker_retries_after_bootstrap
-test_codex_ownership_failure_keeps_marker_and_cleans_installer
+test_codex_chmod_failure_keeps_marker_and_cleans_installer
 test_codex_success_tombstone_prevents_rearm
 test_codex_download_failure_keeps_marker_and_cleans_installer
+test_codex_installer_sha_mismatch_keeps_marker_and_cleans_installer
 test_codex_verification_failure_keeps_marker_and_cleans_installer
 test_codex_atomic_state_move_failure_retains_retry
 test_codex_success_dominates_stale_retry_marker
@@ -2693,6 +2918,7 @@ test_claude_stale_marker_is_removed_before_failed_repair
 test_claude_successful_repair_recreates_the_marker
 test_claude_download_failure_leaves_no_marker
 test_claude_download_failure_preserves_existing_binary
+test_claude_installer_sha_mismatch_preserves_existing_binary
 test_claude_cleanup_removes_both_legacy_installs
 test_claude_cleanup_keeps_fallbacks_when_contract_fails
 test_claude_cleanup_without_the_marker_is_a_noop

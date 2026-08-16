@@ -73,6 +73,19 @@ variable "toolchain" {
     vscode_version              = optional(string, "latest")
     aws_cli_version             = string # dev tool + devbox-aws-creds dependency; NOT in boot/converge fetch path
     aws_cli_install_sha256      = string
+    # sha256 pins for the two FLOATING installer scripts (claude.ai/install.sh
+    # and chatgpt.com/codex/install.sh — upstream edits them in place). When
+    # upstream ships a new installer these go stale and the affected
+    # repair/bootstrap path fails loudly until an admin verifies the new
+    # script and bumps the pin (docs/admin-runbook.md). The CLIs themselves
+    # deliberately stay unpinned and self-update after install.
+    claude_installer_sha256 = string
+    codex_installer_sha256  = string
+    # Exact @getpaseo/cli version + sha256 of its registry tarball
+    # (immutable per version). Governs only the unattended first-bootstrap
+    # install; dev-triggered in-app Paseo updates still float.
+    paseo_cli_version        = string
+    paseo_cli_tarball_sha256 = string
     # Pinned commits (upstream HEADs as of 2026-07-24); shallow-fetched by
     # sha, so the pin self-verifies.
     tmux_resurrect_commit = optional(string, "cff343cf9e81983d3da0c8562b01616f12e8d548")
@@ -82,9 +95,16 @@ variable "toolchain" {
   validation {
     condition = (
       can(regex("^[0-9a-fA-F]{64}$", var.toolchain.nvm_install_sha256)) &&
-      can(regex("^[0-9a-fA-F]{64}$", var.toolchain.aws_cli_install_sha256))
+      can(regex("^[0-9a-fA-F]{64}$", var.toolchain.aws_cli_install_sha256)) &&
+      can(regex("^[0-9a-fA-F]{64}$", var.toolchain.claude_installer_sha256)) &&
+      can(regex("^[0-9a-fA-F]{64}$", var.toolchain.codex_installer_sha256)) &&
+      can(regex("^[0-9a-fA-F]{64}$", var.toolchain.paseo_cli_tarball_sha256))
     )
-    error_message = "toolchain.nvm_install_sha256 and toolchain.aws_cli_install_sha256 must each be a full 64-hex SHA-256 value; replace the example placeholders before planning."
+    error_message = "toolchain sha256 pins (nvm_install_sha256, aws_cli_install_sha256, claude_installer_sha256, codex_installer_sha256, paseo_cli_tarball_sha256) must each be a full 64-hex SHA-256 value; replace the example placeholders before planning."
+  }
+  validation {
+    condition     = can(regex("^[0-9]+\\.[0-9]+\\.[0-9]+$", var.toolchain.paseo_cli_version))
+    error_message = "toolchain.paseo_cli_version must be an exact release version (e.g. 0.4.0), never latest — it addresses the pinned registry tarball."
   }
 }
 
