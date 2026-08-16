@@ -302,26 +302,21 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
   ssh dev@<key>-devbox sudo resize2fs /dev/disk/by-id/google-data
   ```
 - **Change swap.** Change `swap_gib` in tfvars, `terraform -chdir=gcp apply` (an in-place instance-metadata update). It applies at the next converge, when `devbox-converge` reads `devbox-swap-gib` metadata and exports `DEVBOX_SWAP_SIZE_GIB` for `devbox-memory-hotfix` — never a rebuild. Force it now with `scripts/gcp/sync-converge.sh <key>`.
-- **Bump an installer pin.** `https://claude.ai/install.sh` and
-  `https://chatgpt.com/codex/install.sh` are floating URLs pinned by sha256
-  (`toolchain.claude_installer_sha256` / `codex_installer_sha256`), so a new
-  upstream installer makes converge report the affected concern failing on a
-  `sha256sum` mismatch. That failure is the design: only a box whose claude is
-  already broken (or a new box bootstrapping Codex) waits on the bump —
-  healthy boxes never re-download. From a trusted workstation, fetch the
-  script, read the diff against what you expect, then update tfvars and roll
-  out through the normal candidate → canary → promote flow:
-  ```bash
-  curl -fsSL https://claude.ai/install.sh | sha256sum
-  curl -fsSL https://chatgpt.com/codex/install.sh | sha256sum
-  ```
-  The Paseo pin pair (`toolchain.paseo_cli_version` +
-  `paseo_cli_tarball_sha256`) only moves when you choose a newer Paseo for
-  new boxes:
+- **Bump the Paseo pin.** New boxes install the exact
+  `toolchain.paseo_cli_version` npm tarball, verified against
+  `toolchain.paseo_cli_tarball_sha256` (immutable per version — it never goes
+  stale on its own). Move the pair only when you choose a newer Paseo for new
+  boxes, then roll out through the normal candidate → canary → promote flow:
   ```bash
   npm view @getpaseo/cli version
   curl -fsSL https://registry.npmjs.org/@getpaseo/cli/-/cli-<version>.tgz | sha256sum
   ```
+  The `claude.ai`/`chatgpt.com` install scripts are deliberately NOT
+  sha-pinned (policy decision, 2026-08-16): those URLs float — upstream edits
+  them in place — so a pin turned every legitimate installer update into a
+  converge failure until an admin re-pinned. Their fetches rest on
+  vendor-origin trust instead; the toolchain still keeps the downloaded
+  script root-owned and dev-read-only through execution.
 - **Rebuild a box.** The only supported rebuild is a keeper change on `random_uuid.devbox_generation`: the machine's `generation` knob, `ubuntu_2404_image`, the boot template, or either Chrome wrapper. Never `terraform apply -replace=` an instance directly — that skips the lockstep Tailscale key rotation. `terraform -chdir=gcp plan` must show, for each affected machine, exactly 1 generation change + 1 instance replacement + 1 auth-key replacement; if the counts differ, stop, the keeper invariant is broken. `scripts/chrome-devtools-mcp-wrapper.sh` and `scripts/chrome-devtools-mcp-steered-wrapper.sh` are deliberately NOT day-2 (root-owned, they control Chrome's launch flags, `--user-data-dir` and headless mode), so wrapper edits go through this path. After the apply, walk the canary checklist above.
 
 ### Paseo installation ownership
@@ -372,15 +367,13 @@ restart.
 ### Claude Code installation
 
 Claude Code is a dev-owned native install at `/home/dev/.local/bin/claude`,
-installed once by `ensure_claude_code` and self-updating thereafter. The
-*binary* is unpinned: `/var/lib/devbox-runtime/claude-code-installed` records
-the version that was installed and is the only drift trail. To hold a box at
-a version, run `claude install <version>` as `dev` on that box. The
-*installer script* the repair path downloads IS pinned
-(`toolchain.claude_installer_sha256` — see "Bump an installer pin" above):
-install.sh's own manifest check shares an origin with the binary it fetches,
-so only the org pin stands between a compromised `claude.ai/install.sh` and
-root-timer-driven code execution on every box with a broken claude.
+installed once by `ensure_claude_code` and self-updating thereafter. It is
+unpinned: `/var/lib/devbox-runtime/claude-code-installed` records the version
+that was installed and is the only drift trail. To hold a box at a version,
+run `claude install <version>` as `dev` on that box. The install.sh fetch the
+repair path performs rests on vendor-origin trust (see "Bump the Paseo pin"
+above for the policy note) — install.sh's own manifest check shares an origin
+with the binary it fetches, so it is transport protection, not provenance.
 
 That marker is a cache of a live contract check (regular file, dev-owned,
 executable, non-empty `--version`), recomputed every converge and **deleted

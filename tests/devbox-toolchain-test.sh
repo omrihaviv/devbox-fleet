@@ -636,10 +636,7 @@ run_codex_step() {
   local function_file="$workdir/ensure-codex.sh"
 
   extract_codex_step "$function_file"
-  # The pin defaults to the fixture installer's real sha; a test overrides
-  # DEVBOX_CODEX_INSTALLER_SHA256 to exercise the mismatch path.
-  DEVBOX_CODEX_INSTALLER_SHA256="${DEVBOX_CODEX_INSTALLER_SHA256:-$(sha256sum "$workdir/install.sh" | cut -d' ' -f1)}" \
-    DEVBOX_TEST_LOG="$workdir/install.log" \
+  DEVBOX_TEST_LOG="$workdir/install.log" \
     DEVBOX_TEST_CODEX_CHOWN_LOG="$workdir/chown.log" \
     DEVBOX_TEST_CODEX_CHMOD_LOG="$workdir/chmod.log" \
     DEVBOX_TEST_CODEX_CHMOD_FAIL="${DEVBOX_TEST_CODEX_CHMOD_FAIL:-0}" \
@@ -900,8 +897,6 @@ test_matching_versions_are_noop() {
     DEVBOX_CHROME_DEVTOOLS_MCP_VERSION="1.0.0" \
     DEVBOX_AWS_CLI_VERSION="2.0.0" \
     DEVBOX_AWS_CLI_INSTALL_SHA256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
-    DEVBOX_CLAUDE_INSTALLER_SHA256="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" \
-    DEVBOX_CODEX_INSTALLER_SHA256="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
     DEVBOX_PASEO_CLI_VERSION="0.1.107" \
     DEVBOX_PASEO_CLI_TARBALL_SHA256="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" \
     DEVBOX_TMUX_PLUGINS_DIR="$workdir/opt/tmux-plugins" \
@@ -1005,8 +1000,6 @@ test_containerd_migration() {
     DEVBOX_CHROME_DEVTOOLS_MCP_VERSION="1.0.0" \
     DEVBOX_AWS_CLI_VERSION="2.0.0" \
     DEVBOX_AWS_CLI_INSTALL_SHA256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
-    DEVBOX_CLAUDE_INSTALLER_SHA256="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" \
-    DEVBOX_CODEX_INSTALLER_SHA256="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
     DEVBOX_PASEO_CLI_VERSION="0.1.107" \
     DEVBOX_PASEO_CLI_TARBALL_SHA256="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" \
     DEVBOX_TMUX_PLUGINS_DIR="$workdir/opt/tmux-plugins" \
@@ -1347,37 +1340,6 @@ test_codex_download_failure_keeps_marker_and_cleans_installer() {
   installer="$(awk '$1 == "download" { print $2; exit }' "$workdir/download.log")"
   [ -n "$installer" ] || fail "failed Codex download did not record its temporary file"
   [ ! -e "$installer" ] || fail "failed Codex installer download leaked its temporary file"
-}
-
-test_codex_installer_sha_mismatch_keeps_marker_and_cleans_installer() {
-  local installer
-  local workdir
-  workdir="$(mktemp -d)"
-  trap 'rm -rf "$workdir"' RETURN
-
-  make_fake_bin "$workdir/fake-bin"
-  make_fake_codex_installer "$workdir/install.sh"
-  mkdir -p "$workdir/home" "$workdir/etc/devbox"
-  : > "$workdir/etc/devbox/runtime-bucket"
-
-  if DEVBOX_CODEX_INSTALLER_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
-      run_codex_step "$workdir" >/dev/null 2>&1; then
-    fail "Codex install succeeded despite an installer pin mismatch"
-  fi
-  [ -e "$workdir/var/lib/devbox-runtime/codex-cli-required" ] \
-    || fail "Codex installer pin mismatch did not retain retry marker"
-  [ ! -e "$workdir/var/lib/devbox-runtime/codex-cli-installed" ] \
-    || fail "Codex installer pin mismatch created a false success marker"
-  [ ! -e "$workdir/install.log" ] \
-    || fail "an unverified Codex installer was executed"
-  [ ! -e "$workdir/chmod.log" ] \
-    || fail "an unverified Codex installer was made dev-readable"
-  [ ! -e "$workdir/home/.local/bin/codex" ] \
-    || fail "Codex installer pin mismatch produced a command"
-
-  installer="$(awk '$1 == "download" { print $2; exit }' "$workdir/download.log")"
-  [ -n "$installer" ] || fail "Codex installer pin mismatch did not record its temporary file"
-  [ ! -e "$installer" ] || fail "Codex installer pin mismatch leaked the unverified installer"
 }
 
 test_codex_verification_failure_keeps_marker_and_cleans_installer() {
@@ -2538,10 +2500,7 @@ run_claude_step() {
   mkdir -p "$workdir/home"
   extract_claude_step "$function_file"
   make_fake_claude_installer "$workdir/claude-install.sh"
-  # The pin defaults to the fixture installer's real sha; a test overrides
-  # DEVBOX_CLAUDE_INSTALLER_SHA256 to exercise the mismatch path.
   env \
-    DEVBOX_CLAUDE_INSTALLER_SHA256="${DEVBOX_CLAUDE_INSTALLER_SHA256:-$(sha256sum "$workdir/claude-install.sh" | cut -d' ' -f1)}" \
     DEVBOX_TEST_LOG="$workdir/install.log" \
     DEVBOX_TEST_CODEX_INSTALLER_SOURCE="$workdir/claude-install.sh" \
     DEVBOX_TEST_CODEX_DOWNLOAD_LOG="$workdir/download.log" \
@@ -2710,34 +2669,6 @@ test_claude_download_failure_preserves_existing_binary() {
     || fail "pre-existing claude binary was removed before a replacement was known to be fetchable"
 }
 
-# The sha check must run BEFORE the existing $CLAUDE_BIN is cleared: a pin
-# mismatch (upstream shipped a new installer, or the origin is serving
-# something else) must behave exactly like a failed download — loud failure,
-# no marker, and whatever claude the box still has stays in place.
-test_claude_installer_sha_mismatch_preserves_existing_binary() {
-  local installer workdir
-  workdir="$(mktemp -d)"
-  trap 'rm -rf "$workdir"' RETURN
-  make_fake_bin "$workdir/fake-bin"
-  make_stub_claude "$workdir/home/.local/bin/claude" fail
-
-  if DEVBOX_CLAUDE_INSTALLER_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
-      run_claude_step "$workdir" >/dev/null 2>&1; then
-    fail "ensure_claude_code succeeded despite an installer pin mismatch"
-  fi
-  [ ! -f "$workdir/var/lib/devbox-runtime/claude-code-installed" ] \
-    || fail "marker written despite an installer pin mismatch"
-  if [ -f "$workdir/install.log" ] && grep -q 'claude-install target=' "$workdir/install.log"; then
-    fail "an unverified Claude installer was executed"
-  fi
-  [ -e "$workdir/home/.local/bin/claude" ] \
-    || fail "pre-existing claude binary was removed on an installer pin mismatch"
-
-  installer="$(awk '$1 == "download" { print $2; exit }' "$workdir/download.log")"
-  [ -n "$installer" ] || fail "Claude installer pin mismatch did not record its temporary file"
-  [ ! -e "$installer" ] || fail "Claude installer pin mismatch leaked the unverified installer"
-}
-
 seed_legacy_claude_installs() {
   local workdir="$1"
   mkdir -p "$workdir/usr/bin" \
@@ -2850,8 +2781,6 @@ test_require_env_fails_closed_without_the_pin_env() {
     || fail "empty environment did not fail closed in require_env"
   local name
   for name in \
-      DEVBOX_CLAUDE_INSTALLER_SHA256 \
-      DEVBOX_CODEX_INSTALLER_SHA256 \
       DEVBOX_PASEO_CLI_VERSION \
       DEVBOX_PASEO_CLI_TARBALL_SHA256; do
     grep -q "$name" <<<"$out" || fail "require_env does not require $name"
@@ -2880,7 +2809,6 @@ test_codex_failure_marker_retries_after_bootstrap
 test_codex_chmod_failure_keeps_marker_and_cleans_installer
 test_codex_success_tombstone_prevents_rearm
 test_codex_download_failure_keeps_marker_and_cleans_installer
-test_codex_installer_sha_mismatch_keeps_marker_and_cleans_installer
 test_codex_verification_failure_keeps_marker_and_cleans_installer
 test_codex_atomic_state_move_failure_retains_retry
 test_codex_success_dominates_stale_retry_marker
@@ -2918,7 +2846,6 @@ test_claude_stale_marker_is_removed_before_failed_repair
 test_claude_successful_repair_recreates_the_marker
 test_claude_download_failure_leaves_no_marker
 test_claude_download_failure_preserves_existing_binary
-test_claude_installer_sha_mismatch_preserves_existing_binary
 test_claude_cleanup_removes_both_legacy_installs
 test_claude_cleanup_keeps_fallbacks_when_contract_fails
 test_claude_cleanup_without_the_marker_is_a_noop

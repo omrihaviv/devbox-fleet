@@ -28,8 +28,6 @@ variables {
     chrome_devtools_mcp_version = "test"
     aws_cli_version             = "test"
     aws_cli_install_sha256      = "1111111111111111111111111111111111111111111111111111111111111111"
-    claude_installer_sha256     = "2222222222222222222222222222222222222222222222222222222222222222"
-    codex_installer_sha256      = "3333333333333333333333333333333333333333333333333333333333333333"
     paseo_cli_version           = "0.0.1"
     paseo_cli_tarball_sha256    = "4444444444444444444444444444444444444444444444444444444444444444"
   }
@@ -151,8 +149,6 @@ run "reject_placeholder_download_checksums" {
       chrome_devtools_mcp_version = "test"
       aws_cli_version             = "test"
       aws_cli_install_sha256      = "REPLACE_WITH_REAL_SHA"
-      claude_installer_sha256     = "REPLACE_WITH_REAL_SHA"
-      codex_installer_sha256      = "REPLACE_WITH_REAL_SHA"
       paseo_cli_version           = "test"
       paseo_cli_tarball_sha256    = "REPLACE_WITH_REAL_SHA"
     }
@@ -180,8 +176,6 @@ run "reject_non_exact_paseo_version" {
       chrome_devtools_mcp_version = "test"
       aws_cli_version             = "test"
       aws_cli_install_sha256      = "1111111111111111111111111111111111111111111111111111111111111111"
-      claude_installer_sha256     = "2222222222222222222222222222222222222222222222222222222222222222"
-      codex_installer_sha256      = "3333333333333333333333333333333333333333333333333333333333333333"
       paseo_cli_version           = "0.4.0junk"
       paseo_cli_tarball_sha256    = "4444444444444444444444444444444444444444444444444444444444444444"
     }

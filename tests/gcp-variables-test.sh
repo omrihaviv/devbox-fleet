@@ -110,28 +110,25 @@ rg -q 'tmux_continuum_commit[[:space:]]*=[[:space:]]*optional\(string, "[0-9a-f]
 assert_contains 'DEVBOX_TMUX_RESURRECT_COMMIT       = var.toolchain.tmux_resurrect_commit' "$RUNTIME"
 assert_contains 'DEVBOX_TMUX_CONTINUUM_COMMIT       = var.toolchain.tmux_continuum_commit' "$RUNTIME"
 
-# Installer/package pins (2026-08-16): the two floating installer scripts
-# (claude.ai/install.sh, chatgpt.com/codex/install.sh) and the Paseo npm
-# tarball are sha256-pinned; the Paseo bootstrap install is version-pinned.
-# All ride the manifest env to devbox-toolchain. The installer-script URLs
-# float, so the example carries real-at-commit values that deployments must
-# recompute (docs/admin-runbook.md); the Paseo tarball sha is immutable for
-# its version.
-for pin_field in claude_installer_sha256 codex_installer_sha256 paseo_cli_version paseo_cli_tarball_sha256; do
+# Paseo pin (2026-08-16): the bootstrap install is version-pinned and its
+# registry tarball sha256-pinned (immutable per version — never goes stale),
+# riding the manifest env to devbox-toolchain. The claude.ai/chatgpt.com
+# installer scripts are deliberately NOT sha-pinned: a pin was tried and
+# removed the same day because those URLs float, so every legitimate
+# installer update broke the repair/bootstrap path until an admin re-pinned.
+for pin_field in paseo_cli_version paseo_cli_tarball_sha256; do
   rg -q "${pin_field}[[:space:]]*=[[:space:]]*string" "$VARIABLES" \
     || fail "toolchain.${pin_field} must be a required string field"
 done
-for pin_sha in claude_installer_sha256 codex_installer_sha256 paseo_cli_tarball_sha256; do
-  rg -q "var\.toolchain\.${pin_sha}" "$VARIABLES" \
-    || fail "toolchain.${pin_sha} must be covered by the 64-hex validation"
-  rg -q "${pin_sha}[[:space:]]*=[[:space:]]*\"[0-9a-f]{64}\"" "$EXAMPLE" \
-    || fail "example ${pin_sha} must be a complete lowercase SHA-256"
-done
+rg -q "var\.toolchain\.paseo_cli_tarball_sha256" "$VARIABLES" \
+  || fail "toolchain.paseo_cli_tarball_sha256 must be covered by the 64-hex validation"
+rg -q 'paseo_cli_tarball_sha256[[:space:]]*=[[:space:]]*"[0-9a-f]{64}"' "$EXAMPLE" \
+  || fail "example paseo_cli_tarball_sha256 must be a complete lowercase SHA-256"
 rg -q 'paseo_cli_version[[:space:]]*=[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' "$EXAMPLE" \
   || fail "example paseo_cli_version must be an exact version, never latest"
-assert_contains 'DEVBOX_CLAUDE_INSTALLER_SHA256     = var.toolchain.claude_installer_sha256' "$RUNTIME"
-assert_contains 'DEVBOX_CODEX_INSTALLER_SHA256      = var.toolchain.codex_installer_sha256' "$RUNTIME"
 assert_contains 'DEVBOX_PASEO_CLI_VERSION           = var.toolchain.paseo_cli_version' "$RUNTIME"
 assert_contains 'DEVBOX_PASEO_CLI_TARBALL_SHA256    = var.toolchain.paseo_cli_tarball_sha256' "$RUNTIME"
+assert_not_contains 'claude_installer_sha256' "$VARIABLES"
+assert_not_contains 'codex_installer_sha256' "$VARIABLES"
 
 echo "PASS: gcp-variables-test"

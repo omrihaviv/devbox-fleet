@@ -6,15 +6,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
-- Pinned the previously unverified fetch-and-execute paths in
-  `devbox-toolchain`: the Claude Code and Codex installer scripts are now
-  verified against org sha256 pins (`toolchain.claude_installer_sha256`,
-  `toolchain.codex_installer_sha256`) before running — and stay root-owned
-  and dev-read-only through execution — and the Paseo bootstrap
-  install fetches an exact-version registry tarball verified against
-  `toolchain.paseo_cli_tarball_sha256` instead of `npm install @latest`. The
-  agent CLIs' own self-update channels intentionally stay open; Paseo updates
-  remain available on demand from the Paseo app.
+- The Paseo bootstrap install now fetches an exact-version registry tarball
+  (`toolchain.paseo_cli_version`) verified against
+  `toolchain.paseo_cli_tarball_sha256` instead of `npm install @latest`;
+  dev-triggered Paseo updates from the app keep working.
+- The Claude Code and Codex installer scripts stay root-owned and
+  dev-read-only through execution. Their fetches deliberately trust the
+  vendor origins without a sha pin: pins were tried and removed the same day
+  because the URLs float, so every legitimate installer update broke the
+  repair/bootstrap path until an admin re-pinned.
 - Codex Superpowers now installs from Codex's preconfigured official
   marketplace (`openai-curated`, github.com/openai/plugins) instead of the
   plugin author's personal repository.
