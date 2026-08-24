@@ -424,10 +424,11 @@ variable "bedrock_model_env" {
     # Mantle, on-demand invocation rejects it ("use an inference profile"
     # 400 from Bedrock). The DEFAULT_* pins keep the global.* form. Claude
     # Code strips the [1m] capability suffix before calling Bedrock.
-    ANTHROPIC_MODEL               = "anthropic.claude-fable-5[1m]"
-    ANTHROPIC_DEFAULT_FABLE_MODEL = "global.anthropic.claude-fable-5[1m]"
-    ANTHROPIC_DEFAULT_OPUS_MODEL  = "global.anthropic.claude-opus-5[1m]"
-    ANTHROPIC_DEFAULT_HAIKU_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    ANTHROPIC_MODEL                = "anthropic.claude-fable-5[1m]"
+    ANTHROPIC_DEFAULT_FABLE_MODEL  = "global.anthropic.claude-fable-5[1m]"
+    ANTHROPIC_DEFAULT_OPUS_MODEL   = "global.anthropic.claude-opus-5[1m]"
+    ANTHROPIC_DEFAULT_SONNET_MODEL = "global.anthropic.claude-sonnet-5[1m]"
+    ANTHROPIC_DEFAULT_HAIKU_MODEL  = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
   }
 }
 
@@ -438,6 +439,7 @@ variable "bedrock_available_models" {
     "anthropic.claude-fable-5[1m]",
     "global.anthropic.claude-fable-5[1m]",
     "global.anthropic.claude-opus-5[1m]",
+    "global.anthropic.claude-sonnet-5[1m]",
     "global.anthropic.claude-haiku-4-5-20251001-v1:0",
   ]
 }

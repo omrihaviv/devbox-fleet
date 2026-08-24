@@ -4,6 +4,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Claude Sonnet 5 (`global.anthropic.claude-sonnet-5[1m]`) in the fleet
+  Bedrock defaults: offered in bclaude's `/model` picker and Paseo's
+  Claude (Bedrock) provider, and pinned as Claude Code's "sonnet" alias via
+  `ANTHROPIC_DEFAULT_SONNET_MODEL`.
+
 ### Security
 
 - The Paseo bootstrap install now fetches an exact-version registry tarball
