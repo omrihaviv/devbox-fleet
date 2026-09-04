@@ -9,6 +9,7 @@ OPS_AGENT_VERSION="${DEVBOX_OPS_AGENT_VERSION:-}"
 CONFIG="${DEVBOX_OPS_AGENT_CONFIG:-/etc/google-cloud-ops-agent/config.yaml}"
 STATE_DIR="${DEVBOX_RUNTIME_STATE_DIR:-/var/lib/devbox-runtime}"
 VERSION_MARKER="$STATE_DIR/ops-agent.version"
+APT_SOURCE_DIR="${DEVBOX_APT_SOURCE_DIR:-/etc/apt/sources.list.d}"
 
 if [ "${DEVBOX_SKIP_ROOT_CHECK:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
   echo "FATAL: run as root" >&2
@@ -23,22 +24,39 @@ fi
 install -d -m 0755 "$STATE_DIR"
 export DEBIAN_FRONTEND=noninteractive
 
+ops_agent_package_matches_pin() {
+  local installed
+  installed="$(dpkg-query -W -f='${db:Status-Status} ${Version}' google-cloud-ops-agent 2>/dev/null)" \
+    || return 1
+  # Debian distro/build suffixes belong to the pinned upstream release;
+  # another release sharing its prefix (e.g. 2.70.01) does not.
+  [[ "$installed" == "installed $OPS_AGENT_VERSION" \
+    || "$installed" == "installed $OPS_AGENT_VERSION"[~+-]* ]]
+}
+
 package_changed=false
 if [ "${DEVBOX_SKIP_APT:-0}" != 1 ]; then
-  if [ ! -f "$VERSION_MARKER" ] || [ "$(cat "$VERSION_MARKER")" != "$OPS_AGENT_VERSION" ] \
-     || ! dpkg-query -W google-cloud-ops-agent >/dev/null 2>&1; then
-    if [ ! -f /etc/apt/sources.list.d/google-cloud-ops-agent.list ]; then
+  if ! ops_agent_package_matches_pin; then
+    # A failed repair must not leave stale bookkeeping claiming success.
+    rm -f "$VERSION_MARKER"
+    if [ ! -f "$APT_SOURCE_DIR/google-cloud-ops-agent.list" ]; then
       curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
         | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
       echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt google-cloud-ops-agent-noble-all main" \
-        > /etc/apt/sources.list.d/google-cloud-ops-agent.list
+        > "$APT_SOURCE_DIR/google-cloud-ops-agent.list"
     fi
     apt-get update
     apt-get install -y --allow-downgrades "google-cloud-ops-agent=${OPS_AGENT_VERSION}*"
-    printf '%s\n' "$OPS_AGENT_VERSION" > "$VERSION_MARKER"
+    if ! ops_agent_package_matches_pin; then
+      echo "FATAL: google-cloud-ops-agent is not installed at requested version $OPS_AGENT_VERSION after installation" >&2
+      exit 1
+    fi
     package_changed=true
   else
     echo "ops-agent package: already converged"
+  fi
+  if [ ! -f "$VERSION_MARKER" ] || [ "$(cat "$VERSION_MARKER")" != "$OPS_AGENT_VERSION" ]; then
+    printf '%s\n' "$OPS_AGENT_VERSION" > "$VERSION_MARKER"
   fi
 else
   # Test seam: emulate package convergence bookkeeping only.

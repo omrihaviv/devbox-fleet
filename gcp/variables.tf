@@ -105,7 +105,7 @@ variable "toolchain" {
 }
 
 variable "ops_agent_version" {
-  description = "Pinned google-cloud-ops-agent apt package version (e.g. 2.55.0). Delivered via manifest; converged by scripts/gcp/devbox-observability."
+  description = "Pinned google-cloud-ops-agent apt package version (e.g. 2.70.0). Delivered via manifest; checked against the installed package by scripts/gcp/devbox-observability."
   type        = string
 }
 

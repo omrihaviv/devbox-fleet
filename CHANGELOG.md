@@ -4,6 +4,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Ops Agent convergence now checks the installed package status and version,
+  repairs drift even when the version marker is stale, and verifies package
+  installation before recording success. Missing or stale markers on a
+  correct installation are repaired without reinstalling or restarting it.
+  The example configuration now pins Ops Agent 2.70.0.
+
 ### Added
 
 - Claude Fable 5.1 (`global.anthropic.claude-fable-5-1[1m]`) as the fleet
