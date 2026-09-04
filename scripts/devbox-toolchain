@@ -36,6 +36,7 @@ PASEO_CONFIG_DIR="${DEVBOX_PASEO_CONFIG_DIR:-$DEV_HOME/.paseo}"
 PASEO_CONFIG_FILE="${DEVBOX_PASEO_CONFIG_FILE:-$PASEO_CONFIG_DIR/config.json}"
 PASEO_DAEMON_RUNNER="${DEVBOX_PASEO_DAEMON_RUNNER:-/usr/local/bin/devbox-paseo-daemon}"
 PASEO_DAEMON_SERVICE_FILE="${DEVBOX_PASEO_DAEMON_SERVICE_FILE:-/etc/systemd/system/paseo.service}"
+NEEDRESTART_PASEO_CONFIG_FILE="${DEVBOX_NEEDRESTART_PASEO_CONFIG_FILE:-/etc/needrestart/conf.d/99-devbox-paseo.conf}"
 VSCODE_REQUIRED_FILE="${DEVBOX_VSCODE_REQUIRED_FILE:-/var/lib/devbox-runtime/vscode-required}"
 VSCODE_SUCCESS_FILE="${DEVBOX_VSCODE_SUCCESS_FILE:-/var/lib/devbox-runtime/vscode-installed}"
 VSCODE_BIN="${DEVBOX_VSCODE_BIN:-/usr/bin/code}"
@@ -99,6 +100,34 @@ require_env() {
 }
 
 require_env
+
+ensure_needrestart_paseo_protection() {
+  local config_dir tmp
+  config_dir="$(dirname "$NEEDRESTART_PASEO_CONFIG_FILE")"
+
+  install -d -m 0755 "$config_dir"
+  tmp="$(mktemp "$config_dir/.99-devbox-paseo.conf.XXXXXX")"
+  if ! printf '%s\n' \
+      '# Managed by devbox-toolchain. Keep live agents attached during package upgrades.' \
+      '$nrconf{override_rc}{qr(^paseo\.service$)} = 0;' > "$tmp" \
+      || ! chmod 0644 "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if [ -f "$NEEDRESTART_PASEO_CONFIG_FILE" ] \
+      && cmp -s "$tmp" "$NEEDRESTART_PASEO_CONFIG_FILE"; then
+    rm -f "$tmp"
+    echo "needrestart: paseo.service already protected"
+    return 0
+  fi
+
+  if ! mv -f "$tmp" "$NEEDRESTART_PASEO_CONFIG_FILE"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  echo "needrestart: protected paseo.service from package-triggered restarts"
+}
 
 install_if_changed() {
   local src="$1"
@@ -393,7 +422,7 @@ ensure_npm_global_version() {
 # /usr/bin on the dev's PATH, so a broken file there shadows every other copy
 # and a presence-only gate would let it wedge the box forever.
 claude_contract_version() {
-  local resolved version
+  local minimum_version="2.1.255" resolved version version_number
 
   # -f follows symlinks: a symlink to a regular file passes, a directory fails.
   [ -f "$CLAUDE_BIN" ] || return 1
@@ -408,6 +437,10 @@ claude_contract_version() {
     HOME="$DEV_HOME" \
     "$CLAUDE_BIN" --version 2>/dev/null)" || return 1
   [ -n "$version" ] || return 1
+  version_number="${version%% *}"
+  [[ "$version_number" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [ "$(printf '%s\n' "$minimum_version" "$version_number" | sort -V | head -1)" = "$minimum_version" ] \
+    || return 1
 
   printf '%s\n' "$version"
 }
@@ -1092,10 +1125,24 @@ ensure_agent_plugins() {
         https://github.com/openai/codex-plugin-cc.git --scope user
     sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
       "$CLAUDE_BIN" plugin install codex@openai-codex --scope user
-    # openai-curated is Codex's preconfigured official marketplace
-    # (github.com/openai/plugins), which carries superpowers — no
-    # `plugin marketplace add`, and never the author's personal repo
-    # (obra/superpowers): every source here must be a vendor-org channel.
+  )
+
+  # Codex supplies its reserved openai-curated marketplace only to an
+  # authenticated session. A new box has Codex installed before the developer
+  # signs in, so leave the retry marker armed without failing convergence.
+  if ! (
+    cd "$DEV_HOME"
+    sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
+      "$CODEX_BIN" login status >/dev/null 2>&1
+  ); then
+    echo "agent-plugins: Claude plugins installed; waiting for Codex login"
+    return 0
+  fi
+
+  (
+    cd "$DEV_HOME"
+    # Never use the author's personal repo (obra/superpowers): this source
+    # must remain Codex's authenticated, vendor-owned marketplace.
     sudo -u "$DEV_USER" -H env HOME="$DEV_HOME" \
       "$CODEX_BIN" plugin add superpowers@openai-curated
   )
@@ -1278,6 +1325,7 @@ run_tool() {
   fi
 }
 
+ensure_needrestart_paseo_protection
 run_tool base-tools ensure_base_tools
 run_tool tailscale ensure_tailscale_package
 run_tool gh ensure_gh

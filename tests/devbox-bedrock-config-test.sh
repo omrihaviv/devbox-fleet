@@ -12,6 +12,25 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/state" "$work/home" "$work/etc" \
   "$work/usr/local/bin" "$work/home/.local/bin"
+cat > "$work/home/.local/bin/paseo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$*" = --help ]; then
+  [ "${DEVBOX_TEST_PASEO_HELP_FAIL:-0}" != 1 ] || exit 1
+  if [ "${DEVBOX_TEST_PASEO_LEGACY:-0}" = 1 ]; then
+    printf 'Commands:\n  daemon [options]  Manage the daemon\n'
+  else
+    printf 'Commands:\n  reload [options]  Reload the daemon configuration\n'
+  fi
+  exit 0
+fi
+[ "$*" = 'reload --json' ] || exit 2
+[ "${DEVBOX_TEST_PASEO_LEGACY:-0}" != 1 ] || exit 2
+printf '%s\n' "$*" >> "$DEVBOX_TEST_PASEO_LOG"
+[ "${DEVBOX_TEST_PASEO_RELOAD_FAIL:-0}" != 1 ] || exit 1
+printf '{"appliedPaths":["agents.providers.bclaude"],"restartRequiredPaths":[],"overrideControlledPaths":[]}\n'
+EOF
+chmod +x "$work/home/.local/bin/paseo"
 
 run_concern() {
   DEVBOX_RUNTIME_STATE_DIR="$work/state" \
@@ -22,7 +41,9 @@ run_concern() {
   DEVBOX_CLAUDE_BIN="$work/home/.local/bin/claude" \
   DEVBOX_BCLAUDE_BIN="$work/usr/local/bin/bclaude" \
   DEVBOX_BDCC_BIN="$work/usr/local/bin/bdcc" \
+  DEVBOX_PASEO_BIN="$work/home/.local/bin/paseo" \
   DEVBOX_PASEO_CONFIG_FILE="$work/home/.paseo/config.json" \
+  DEVBOX_TEST_PASEO_LOG="$work/paseo.log" \
   DEVBOX_SKIP_ROOT_CHECK=1 \
   bash "$CONCERN"
 }
@@ -532,6 +553,8 @@ JSON
 chmod 0600 "$work/home/.paseo/config.json"
 : > "$work/state/claude-code-installed"
 run_concern >/dev/null
+[ "$(cat "$work/paseo.log")" = "reload --json" ] \
+  || fail "Paseo daemon config was not reloaded after provider render"
 
 cfg="$work/home/.paseo/config.json"
 jq -e '.agents.providers.bclaude.extends == "claude"' "$cfg" >/dev/null \
@@ -635,8 +658,33 @@ jq -e '.agents.providers.bclaude | keys
 
 echo "== paseo provider: idempotent"
 before="$(cat "$cfg")"
+reloads_before="$(wc -l < "$work/paseo.log")"
 run_concern >/dev/null
 [ "$before" = "$(cat "$cfg")" ] || fail "second run changed the paseo config"
+[ "$(wc -l < "$work/paseo.log")" -eq "$((reloads_before + 1))" ] \
+  || fail "an unchanged valid provider render must retry the non-restarting Paseo reload"
+
+echo "== paseo provider: older CLIs keep the documented restart behavior"
+reloads_before="$(wc -l < "$work/paseo.log")"
+if ! legacy_out="$(DEVBOX_TEST_PASEO_LEGACY=1 run_concern 2>&1)"; then
+  fail "a supported older Paseo without reload must still converge its config"
+fi
+rg -q --fixed-strings 'restart Paseo to load provider changes' <<<"$legacy_out" \
+  || fail "older Paseo must report that its provider changes need a restart"
+[ "$(wc -l < "$work/paseo.log")" -eq "$reloads_before" ] \
+  || fail "older Paseo must not receive an unsupported reload command"
+
+echo "== paseo provider: help/reload failures are fatal and clean up temporary configs"
+for failure_mode in DEVBOX_TEST_PASEO_HELP_FAIL DEVBOX_TEST_PASEO_RELOAD_FAIL; do
+  if (export "$failure_mode=1"; run_concern) >"$work/paseo-failure.log" 2>&1; then
+    fail "$failure_mode must fail the concern"
+  fi
+  if compgen -G "$work/home/.paseo/.config.json.*" >/dev/null; then
+    fail "$failure_mode leaked a temporary provider config"
+  fi
+  [ "$before" = "$(cat "$cfg")" ] || fail "$failure_mode corrupted the saved config"
+done
+run_concern >/dev/null || fail "provider reload must recover on the next successful run"
 
 echo "== paseo provider: absent config is skipped, malformed is refused"
 rm -f "$cfg"
