@@ -376,7 +376,7 @@ above for the policy note) — install.sh's own manifest check shares an origin
 with the binary it fetches, so it is transport protection, not provenance.
 
 That marker is a cache of a live contract check (regular file, dev-owned,
-executable, non-empty `--version`), recomputed every converge and **deleted
+executable, version 2.1.255 or newer), recomputed every converge and **deleted
 before any repair attempt**. So an absent marker means claude is currently
 broken on that box, and three things deliberately stop: the old-install
 cleanup, the agent-plugins concern, and every Bedrock-side action in
@@ -401,8 +401,13 @@ cleanup removes the nvm package directory but leaves that symlink dangling
 (a known, accepted defect). The package behind it is gone and the entry is
 harmless — do not escalate on its presence alone.
 
-`paseo provider ls` shows `bclaude` only after the daemon reloads the updated
-config. Use `sudo systemctl restart paseo` when an immediate reload is wanted.
+`paseo provider ls` shows `bclaude` after the daemon reloads the updated
+config. Convergence runs `paseo reload --json` automatically when the
+installed CLI supports it, including when the config file is unchanged.
+This keeps active agents running. Older CLIs such as the supported 0.4
+bootstrap pin lack `reload`; convergence warns that their provider changes
+take effect on the next daemon restart. Use `sudo systemctl restart paseo`
+for those versions when an immediate update is needed.
 
 ## Day-2 changes to `devbox-onboard` (no rebuild)
 

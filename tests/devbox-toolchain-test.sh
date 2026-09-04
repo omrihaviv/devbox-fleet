@@ -329,6 +329,26 @@ case "$*" in
     shift 3
     "$@"
     ;;
+  *"${CODEX_BIN:-/__unset_codex__} login status"*)
+    if [ "$#" -ne 8 ] \
+        || [ "$1" != -u ] \
+        || [ "$2" != "$DEV_USER" ] \
+        || [ "$3" != -H ] \
+        || [ "$4" != env ] \
+        || [ "$5" != "HOME=$DEV_HOME" ] \
+        || [ "$6" != "$CODEX_BIN" ] \
+        || [ "$7" != login ] \
+        || [ "$8" != status ]; then
+      echo "Codex login check did not use the expected dev-user boundary: $*" >&2
+      exit 1
+    fi
+    if [ "$PWD" != "$DEV_HOME" ]; then
+      echo "Codex login check did not start from the dev home: cwd=$PWD expected=$DEV_HOME" >&2
+      exit 1
+    fi
+    shift 5
+    "$@"
+    ;;
   *" plugin "*)
     if [ "$#" -lt 7 ] \
         || [ "$1" != -u ] \
@@ -468,6 +488,7 @@ cat > "$fake_bin/codex" <<'EOF'
 #!/usr/bin/env bash
 command="codex $*"
 echo "$command" >> "$DEVBOX_TEST_PLUGIN_LOG"
+[ "$command" != "codex login status" ] || [ "${DEVBOX_TEST_CODEX_NOT_LOGGED_IN:-0}" != 1 ] || exit 1
 [ "${DEVBOX_TEST_PLUGIN_FAIL_COMMAND:-}" != "$command" ]
 EOF
   cat > "$fake_bin/tailscale" <<'EOF'
@@ -718,9 +739,10 @@ run_agent_plugins_step() {
   local function_file="$workdir/ensure-agent-plugins.sh"
 
   extract_agent_plugins_step "$function_file"
-  DEVBOX_TEST_LOG="$workdir/commands.log" \
+    DEVBOX_TEST_LOG="$workdir/commands.log" \
     DEVBOX_TEST_PLUGIN_LOG="$workdir/plugin.log" \
     DEVBOX_TEST_PLUGIN_FAIL_COMMAND="${DEVBOX_TEST_PLUGIN_FAIL_COMMAND:-}" \
+    DEVBOX_TEST_CODEX_NOT_LOGGED_IN="${DEVBOX_TEST_CODEX_NOT_LOGGED_IN:-0}" \
     DEV_USER="$test_user" \
     DEV_HOME="$workdir/home" \
     GCP_RUNTIME_BUCKET_FILE="$workdir/etc/devbox/runtime-bucket" \
@@ -863,6 +885,7 @@ test_matching_versions_are_noop() {
     DEVBOX_PASEO_SYSTEM_BIN="$workdir/usr/local/bin/paseo" \
     DEVBOX_PASEO_CONFIG_DIR="$workdir/home/.paseo" \
     DEVBOX_PASEO_CONFIG_FILE="$workdir/home/.paseo/config.json" \
+    DEVBOX_NEEDRESTART_PASEO_CONFIG_FILE="$workdir/etc/needrestart/conf.d/99-devbox-paseo.conf" \
     DEVBOX_VSCODE_REQUIRED_FILE="$workdir/var/lib/devbox-runtime/vscode-required" \
     DEVBOX_VSCODE_SUCCESS_FILE="$workdir/var/lib/devbox-runtime/vscode-installed" \
     DEVBOX_VSCODE_BIN="$workdir/fake-bin/code" \
@@ -966,6 +989,7 @@ test_containerd_migration() {
     DEVBOX_PASEO_SYSTEM_BIN="$workdir/usr/local/bin/paseo" \
     DEVBOX_PASEO_CONFIG_DIR="$workdir/home/.paseo" \
     DEVBOX_PASEO_CONFIG_FILE="$workdir/home/.paseo/config.json" \
+    DEVBOX_NEEDRESTART_PASEO_CONFIG_FILE="$workdir/etc/needrestart/conf.d/99-devbox-paseo.conf" \
     DEVBOX_VSCODE_REQUIRED_FILE="$workdir/var/lib/devbox-runtime/vscode-required" \
     DEVBOX_VSCODE_SUCCESS_FILE="$workdir/var/lib/devbox-runtime/vscode-installed" \
     DEVBOX_VSCODE_BIN="$workdir/fake-bin/code" \
@@ -1038,7 +1062,7 @@ test_agent_plugins_new_gcp_bootstrap_and_post_success_noop() {
   run_agent_plugins_step "$workdir"
 
   mapfile -t commands < "$workdir/plugin.log"
-  [ "${#commands[@]}" -eq 5 ] || fail "new GCP bootstrap did not run all five plugin commands"
+  [ "${#commands[@]}" -eq 6 ] || fail "new GCP bootstrap did not run all six plugin commands"
   [ "${commands[0]}" = "claude plugin marketplace add https://github.com/anthropics/claude-plugins-official.git --scope user" ] \
     || fail "Claude official marketplace was not added at user scope"
   [ "${commands[1]}" = "claude plugin install superpowers@claude-plugins-official --scope user" ] \
@@ -1047,8 +1071,10 @@ test_agent_plugins_new_gcp_bootstrap_and_post_success_noop() {
     || fail "OpenAI Codex marketplace was not added to Claude Code"
   [ "${commands[3]}" = "claude plugin install codex@openai-codex --scope user" ] \
     || fail "Codex plugin was not installed for Claude Code"
-  [ "${commands[4]}" = "codex plugin add superpowers@openai-curated" ] \
-    || fail "Superpowers was not installed for Codex from the preconfigured official marketplace"
+  [ "${commands[4]}" = "codex login status" ] \
+    || fail "Codex authentication was not checked before official marketplace use"
+  [ "${commands[5]}" = "codex plugin add superpowers@openai-curated" ] \
+    || fail "Superpowers was not installed for Codex from the official marketplace"
   if grep -q 'obra/superpowers' "$workdir/plugin.log"; then
     fail "Codex Superpowers must come from openai-curated, not a personal marketplace clone"
   fi
@@ -1060,8 +1086,38 @@ test_agent_plugins_new_gcp_bootstrap_and_post_success_noop() {
   mkdir -p "$workdir/var/lib/devbox-bootstrap"
   : > "$workdir/var/lib/devbox-bootstrap/complete"
   run_agent_plugins_step "$workdir"
-  [ "$(wc -l < "$workdir/plugin.log")" -eq 5 ] \
+  [ "$(wc -l < "$workdir/plugin.log")" -eq 6 ] \
     || fail "plugin commands reran after successful provisioning"
+}
+
+test_agent_plugins_defers_codex_until_login_without_failing() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+
+  make_fake_bin "$workdir/fake-bin"
+  mkdir -p "$workdir/home" "$workdir/etc/devbox" "$workdir/var/lib/devbox-runtime"
+  : > "$workdir/etc/devbox/runtime-bucket"
+  : > "$workdir/var/lib/devbox-runtime/codex-cli-installed"
+  : > "$workdir/var/lib/devbox-runtime/claude-code-installed"
+
+  DEVBOX_TEST_CODEX_NOT_LOGGED_IN=1 run_agent_plugins_step "$workdir"
+  [ "$(wc -l < "$workdir/plugin.log")" -eq 5 ] \
+    || fail "logged-out bootstrap did not stop after the Codex login check"
+  ! grep -qF "codex plugin add" "$workdir/plugin.log" \
+    || fail "logged-out bootstrap attempted to install from the unavailable official marketplace"
+  [ -e "$workdir/var/lib/devbox-runtime/agent-plugins-required" ] \
+    || fail "logged-out bootstrap did not retain its retry marker"
+  [ ! -e "$workdir/var/lib/devbox-runtime/agent-plugins-installed" ] \
+    || fail "logged-out bootstrap created a false success marker"
+
+  run_agent_plugins_step "$workdir"
+  [ "$(wc -l < "$workdir/plugin.log")" -eq 11 ] \
+    || fail "plugin provisioning did not retry after Codex login"
+  [ ! -e "$workdir/var/lib/devbox-runtime/agent-plugins-required" ] \
+    || fail "successful post-login retry did not clear its marker"
+  [ -e "$workdir/var/lib/devbox-runtime/agent-plugins-installed" ] \
+    || fail "successful post-login retry did not create its marker"
 }
 
 test_agent_plugins_skip_existing_gcp_and_aws() {
@@ -1123,7 +1179,7 @@ test_agent_plugins_wait_for_codex_and_retry_after_bootstrap() {
   mkdir -p "$workdir/var/lib/devbox-bootstrap"
   : > "$workdir/var/lib/devbox-bootstrap/complete"
   run_agent_plugins_step "$workdir"
-  [ "$(wc -l < "$workdir/plugin.log")" -eq 9 ] \
+  [ "$(wc -l < "$workdir/plugin.log")" -eq 10 ] \
     || fail "plugin provisioning did not stop at failure and retry all idempotent commands"
   [ ! -e "$workdir/var/lib/devbox-runtime/agent-plugins-required" ] \
     || fail "successful plugin retry did not clear retry marker"
@@ -2340,16 +2396,20 @@ run_claude_contract() {
 }
 
 # Writes a stub claude at $1 whose --version behaviour is chosen by $2:
-#   ok    -> exits 0, prints a version
-#   empty -> exits 0, prints nothing
-#   fail  -> exits 3
+#   ok      -> exits 0, prints a current version
+#   minimum -> exits 0, prints the minimum Fable 5.1-compatible version
+#   old     -> exits 0, prints the version immediately below the minimum
+#   empty   -> exits 0, prints nothing
+#   fail    -> exits 3
 make_stub_claude() {
   local path="$1" mode="$2"
   mkdir -p "$(dirname "$path")"
   case "$mode" in
-    ok)    printf '#!/bin/sh\nprintf "2.9.9 (Claude Code)\\n"\n' > "$path" ;;
-    empty) printf '#!/bin/sh\nexit 0\n' > "$path" ;;
-    fail)  printf '#!/bin/sh\nexit 3\n' > "$path" ;;
+    ok)      printf '#!/bin/sh\nprintf "2.9.9 (Claude Code)\\n"\n' > "$path" ;;
+    minimum) printf '#!/bin/sh\nprintf "2.1.255 (Claude Code)\\n"\n' > "$path" ;;
+    old)     printf '#!/bin/sh\nprintf "2.1.254 (Claude Code)\\n"\n' > "$path" ;;
+    empty)   printf '#!/bin/sh\nexit 0\n' > "$path" ;;
+    fail)    printf '#!/bin/sh\nexit 3\n' > "$path" ;;
     *)     fail "unknown stub mode: $mode" ;;
   esac
   chmod 0755 "$path"
@@ -2365,6 +2425,31 @@ test_claude_contract_accepts_a_good_binary() {
   out="$(run_claude_contract "$workdir")" || fail "contract rejected a good binary"
   [ "$out" = "2.9.9 (Claude Code)" ] \
     || fail "contract did not print the version: $out"
+}
+
+test_claude_contract_accepts_the_fable_5_1_minimum_version() {
+  local workdir out
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  make_fake_bin "$workdir/fake-bin"
+  make_stub_claude "$workdir/home/.local/bin/claude" minimum
+
+  out="$(run_claude_contract "$workdir")" \
+    || fail "contract rejected the minimum Fable 5.1-compatible Claude Code"
+  [ "$out" = "2.1.255 (Claude Code)" ] \
+    || fail "contract did not print the minimum compatible version: $out"
+}
+
+test_claude_contract_rejects_a_pre_fable_5_1_version() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  make_fake_bin "$workdir/fake-bin"
+  make_stub_claude "$workdir/home/.local/bin/claude" old
+
+  if run_claude_contract "$workdir" >/dev/null 2>&1; then
+    fail "contract accepted Claude Code older than Fable 5.1 requires"
+  fi
 }
 
 test_claude_contract_rejects_a_directory() {
@@ -2787,7 +2872,34 @@ test_require_env_fails_closed_without_the_pin_env() {
   done
 }
 
+test_needrestart_defers_paseo_before_package_work() {
+  local function_file protect_line tools_line workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  function_file="$workdir/ensure-needrestart.sh"
+
+  awk '/^ensure_needrestart_paseo_protection\(\)/,/^}$/' \
+    "$repo_root/scripts/devbox-toolchain" > "$function_file"
+  [ -s "$function_file" ] || fail "ensure_needrestart_paseo_protection not found"
+
+  NEEDRESTART_PASEO_CONFIG_FILE="$workdir/etc/needrestart/conf.d/99-devbox-paseo.conf" \
+    bash -c 'set -euo pipefail; source "$1"; ensure_needrestart_paseo_protection' \
+      _ "$function_file"
+
+  grep -qxF '$nrconf{override_rc}{qr(^paseo\.service$)} = 0;' \
+    "$workdir/etc/needrestart/conf.d/99-devbox-paseo.conf" \
+    || fail "needrestart config does not defer paseo.service"
+
+  protect_line="$(grep -n '^ensure_needrestart_paseo_protection$' \
+    "$repo_root/scripts/devbox-toolchain" | cut -d: -f1)"
+  tools_line="$(grep -n '^run_tool base-tools ' \
+    "$repo_root/scripts/devbox-toolchain" | cut -d: -f1)"
+  [ -n "$protect_line" ] && [ "$protect_line" -lt "$tools_line" ] \
+    || fail "Paseo protection is not installed before package convergence"
+}
+
 test_require_env_fails_closed_without_the_pin_env
+test_needrestart_defers_paseo_before_package_work
 test_paseo_new_gcp_bootstrap_installs_pinned_tarball_and_writes_tailnet_config
 test_paseo_tarball_download_failure_retains_retry_marker
 test_paseo_tarball_sha_mismatch_retains_retry_marker
@@ -2821,6 +2933,7 @@ test_vscode_launcher_install_failure_keeps_marker_and_cleans_tmp
 test_vscode_success_marker_repairs_missing_launcher
 test_vscode_launcher_stops_when_tailscale_serve_fails
 test_agent_plugins_new_gcp_bootstrap_and_post_success_noop
+test_agent_plugins_defers_codex_until_login_without_failing
 test_agent_plugins_skip_existing_gcp_and_aws
 test_agent_plugins_wait_for_codex_and_retry_after_bootstrap
 test_agent_plugins_wait_for_claude
@@ -2833,6 +2946,8 @@ test_tmux_plugins_fetch_failure_fails_and_leaves_conf_alone
 test_matching_versions_are_noop
 test_containerd_migration
 test_claude_contract_accepts_a_good_binary
+test_claude_contract_accepts_the_fable_5_1_minimum_version
+test_claude_contract_rejects_a_pre_fable_5_1_version
 test_claude_contract_rejects_a_directory
 test_claude_contract_rejects_non_executable
 test_claude_contract_rejects_wrong_owner

@@ -105,7 +105,7 @@ variable "toolchain" {
 }
 
 variable "ops_agent_version" {
-  description = "Pinned google-cloud-ops-agent apt package version (e.g. 2.55.0). Delivered via manifest; converged by scripts/gcp/devbox-observability."
+  description = "Pinned google-cloud-ops-agent apt package version (e.g. 2.70.0). Delivered via manifest; checked against the installed package by scripts/gcp/devbox-observability."
   type        = string
 }
 
@@ -418,14 +418,11 @@ variable "bedrock_model_env" {
   description = "Model/config env delivered as one `env` assignment per key rendered into /usr/local/bin/bclaude, between the AWS_REGION and CLAUDE_CODE_USE_BEDROCK assignments the concern always sets. Must not include a credential selector (AWS_PROFILE, AWS_DEFAULT_PROFILE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_SECURITY_TOKEN, AWS_CREDENTIAL_EXPIRATION, AWS_BEARER_TOKEN_BEDROCK): the wrapper strips those via `env -u` earlier on the same command line, and setting one here would re-set it right back, silently routing Bedrock traffic as the wrong principal or aborting Claude Code's credential chain outright (AWS_PROFILE verified on-box, 2.1.207). devbox-bedrock-config fails loudly if this map contains one."
   type        = map(string)
   default = {
-    CLAUDE_CODE_USE_MANTLE   = "1"
     ENABLE_PROMPT_CACHING_1H = "1"
-    # Bare model ID: works under Mantle (CLAUDE_CODE_USE_MANTLE=1); without
-    # Mantle, on-demand invocation rejects it ("use an inference profile"
-    # 400 from Bedrock). The DEFAULT_* pins keep the global.* form. Claude
+    # Use the global inference profiles authorized by aws-federation. Claude
     # Code strips the [1m] capability suffix before calling Bedrock.
-    ANTHROPIC_MODEL                = "anthropic.claude-fable-5[1m]"
-    ANTHROPIC_DEFAULT_FABLE_MODEL  = "global.anthropic.claude-fable-5[1m]"
+    ANTHROPIC_MODEL                = "global.anthropic.claude-fable-5-1[1m]"
+    ANTHROPIC_DEFAULT_FABLE_MODEL  = "global.anthropic.claude-fable-5-1[1m]"
     ANTHROPIC_DEFAULT_OPUS_MODEL   = "global.anthropic.claude-opus-5[1m]"
     ANTHROPIC_DEFAULT_SONNET_MODEL = "global.anthropic.claude-sonnet-5[1m]"
     ANTHROPIC_DEFAULT_HAIKU_MODEL  = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
@@ -436,7 +433,7 @@ variable "bedrock_available_models" {
   description = "Model IDs offered in bclaude's /model picker — rendered as a --settings availableModels JSON on the claude invocation. Empty list omits the flag."
   type        = list(string)
   default = [
-    "anthropic.claude-fable-5[1m]",
+    "global.anthropic.claude-fable-5-1[1m]",
     "global.anthropic.claude-fable-5[1m]",
     "global.anthropic.claude-opus-5[1m]",
     "global.anthropic.claude-sonnet-5[1m]",

@@ -84,14 +84,14 @@ fi
 
 [ -f "$VARIABLES" ] || fail "gcp/variables.tf missing"
 for expected_pin in \
-  'ANTHROPIC_MODEL[[:space:]]*=[[:space:]]*"anthropic\.claude-fable-5\[1m\]"' \
-  'ANTHROPIC_DEFAULT_FABLE_MODEL[[:space:]]*=[[:space:]]*"global\.anthropic\.claude-fable-5\[1m\]"' \
+  'ANTHROPIC_MODEL[[:space:]]*=[[:space:]]*"global\.anthropic\.claude-fable-5-1\[1m\]"' \
+  'ANTHROPIC_DEFAULT_FABLE_MODEL[[:space:]]*=[[:space:]]*"global\.anthropic\.claude-fable-5-1\[1m\]"' \
   'ANTHROPIC_DEFAULT_OPUS_MODEL[[:space:]]*=[[:space:]]*"global\.anthropic\.claude-opus-5\[1m\]"'; do
   rg -q "$expected_pin" "$VARIABLES" \
-    || fail "Claude Bedrock Fable and Opus pins must request 1M context"
+    || fail "Claude Bedrock Fable 5.1 and Opus pins must request 1M context"
 done
 for expected_picker_model in \
-  'anthropic\.claude-fable-5\[1m\]' \
+  'global\.anthropic\.claude-fable-5-1\[1m\]' \
   'global\.anthropic\.claude-fable-5\[1m\]' \
   'global\.anthropic\.claude-opus-5\[1m\]'; do
   rg -q "^[[:space:]]*\"${expected_picker_model}\",[[:space:]]*$" "$VARIABLES" \
@@ -99,6 +99,9 @@ for expected_picker_model in \
   [ "$(rg -c "^[[:space:]]*\"${expected_picker_model}\",[[:space:]]*$" "$VARIABLES")" -eq 1 ] \
     || fail "Claude Bedrock picker must contain exactly one ${expected_picker_model} entry"
 done
+if rg -q 'CLAUDE_CODE_USE_MANTLE|"anthropic\.claude-fable-5\[1m\]"' "$VARIABLES"; then
+  fail "fleet Bedrock defaults must use inference profiles, not Mantle or bare Fable model ids"
+fi
 bedrock_available_models_default="$(
   awk '
     /^variable "bedrock_available_models"/ { in_picker = 1 }

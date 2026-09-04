@@ -26,8 +26,9 @@
 #   - agents.providers.bclaude           (merged into ~/.paseo/config.json,
 #                                         registering bclaude as a selectable
 #                                         Paseo agent; GATED on the same claude
-#                                         success marker, and takes effect only
-#                                         after a dev-initiated daemon restart)
+#                                         success marker, then live-reloaded
+#                                         without restarting the daemon when
+#                                         its CLI supports reload)
 # NO-OP when the manifest has no .bedrock object — plumbing lands first.
 # Never touches ~/.claude/settings.json.
 set -euo pipefail
@@ -43,6 +44,7 @@ CLAUDE_SUCCESS_FILE="${DEVBOX_CLAUDE_SUCCESS_FILE:-/var/lib/devbox-runtime/claud
 CLAUDE_BIN="${DEVBOX_CLAUDE_BIN:-$DEV_HOME/.local/bin/claude}"
 BCLAUDE_BIN="${DEVBOX_BCLAUDE_BIN:-/usr/local/bin/bclaude}"
 BDCC_BIN="${DEVBOX_BDCC_BIN:-/usr/local/bin/bdcc}"
+PASEO_BIN="${DEVBOX_PASEO_BIN:-$DEV_HOME/.local/bin/paseo}"
 PASEO_CONFIG_FILE="${DEVBOX_PASEO_CONFIG_FILE:-$DEV_HOME/.paseo/config.json}"
 
 # Every inherited variable that could select a different principal or bypass
@@ -80,6 +82,14 @@ dev_owner="$(stat -c %U "$DEV_HOME" 2>/dev/null || echo dev)"
 install_as_dev() { # path mode content-file
   install -m "$2" "$3" "$1" 2>/dev/null || { cp "$3" "$1"; chmod "$2" "$1"; }
   chown "$dev_owner:$dev_owner" "$1" 2>/dev/null || true
+}
+
+run_as_dev() {
+  if [ "${DEVBOX_SKIP_ROOT_CHECK:-0}" = 1 ]; then
+    HOME="$DEV_HOME" "$@"
+  else
+    sudo -u "$dev_owner" -H env HOME="$DEV_HOME" "$@"
+  fi
 }
 
 # ----- 1. /etc/devbox/bedrock.json -----
@@ -415,6 +425,27 @@ else
         chown "$dev_owner:$dev_owner" "$tmp_paseo" 2>/dev/null || true
         chmod 0600 "$tmp_paseo"
         mv -f "$tmp_paseo" "$PASEO_CONFIG_FILE"
+      fi
+      # No temporary config should survive a failed CLI/help/reload command.
+      rm -f "$tmp_paseo"
+      # Paseo keeps provider configuration in memory. Newer CLIs can reload
+      # without restarting active agents; the supported 0.4 bootstrap pin
+      # predates that command and keeps its existing restart-based behavior.
+      if [ -x "$PASEO_BIN" ]; then
+        if ! paseo_help="$(run_as_dev "$PASEO_BIN" --help)"; then
+          echo "devbox-bedrock-config: failed to inspect Paseo CLI capabilities" >&2
+          exit 1
+        fi
+        if grep -qE '^[[:space:]]+reload([[:space:]]|$)' <<< "$paseo_help"; then
+          # Retry even unchanged renders so a previously failed reload is
+          # repaired on the next converge. Actual reload errors stay fatal.
+          if ! run_as_dev "$PASEO_BIN" reload --json >/dev/null; then
+            echo "devbox-bedrock-config: failed to reload Paseo daemon config" >&2
+            exit 1
+          fi
+        else
+          echo "WARN: installed Paseo has no reload command; restart Paseo to load provider changes" >&2
+        fi
       fi
     else
       echo "devbox-bedrock-config: paseo provider render failed validation; config left unchanged" >&2

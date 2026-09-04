@@ -36,7 +36,7 @@ toolchain = {
   # tmux_continuum_commit     = "0698e8f4b17d6454c71bf5212895ec055c578da0"
 }
 
-ops_agent_version = "2.55.0"
+ops_agent_version = "2.70.0"
 
 # New or rebuilt machines get a 120 GB root disk by default. Terraform
 # intentionally ignores root-disk size after creation; use root_disk_gb on a
