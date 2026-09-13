@@ -47,7 +47,7 @@ locals {
   }
 
   # Bedrock object is OPTIONAL: empty role ARN → key omitted entirely →
-  # devbox-bedrock-config no-ops (plumbing lands before federation).
+  # devbox-bedrock-config removes any previously installed Bedrock setup.
   runtime_manifest = merge(
     {
       schema = 1

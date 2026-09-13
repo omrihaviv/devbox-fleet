@@ -390,10 +390,10 @@ variable "oomd_swap_used_limit" {
 }
 
 # ----- AWS federation (all optional: absent → manifest omits the bedrock
-# object → devbox-bedrock-config is a no-op; lets plumbing land first) -----
+# object → devbox-bedrock-config removes the managed Bedrock setup) -----
 
 variable "bedrock_role_arn" {
-  description = "ARN of the devbox-gcp-workload role from aws-federation/ outputs. Empty until that root is applied and its role_arn output is pasted here."
+  description = "ARN of the devbox-gcp-workload role from aws-federation/ outputs. Empty disables the fleet's managed Bedrock setup; convergence removes any previously installed configuration. This does not revoke the AWS role's IAM trust or existing temporary credentials."
   type        = string
   default     = ""
   validation {
@@ -442,7 +442,7 @@ variable "bedrock_available_models" {
 }
 
 variable "bedrock_codex_config" {
-  description = "Codex defaults for the Bedrock provider, rendered sorted as TOML string values into a machine-seeded block that devbox-bedrock-config PREPENDS to ~/.codex/config.toml, after the fixed model_provider = \"amazon-bedrock\" line — so plain codex defaults to Bedrock (no wrapper command). The block is hash-gated: once a dev edits anything inside it, converge leaves the file alone; an unedited block is re-rendered in place. A non-empty map also removes the legacy ~/.codex/bedrock.config.toml. Empty map seeds no block."
+  description = "Codex defaults for the Bedrock provider, rendered sorted as TOML string values into a machine-seeded block that devbox-bedrock-config PREPENDS to ~/.codex/config.toml, after the fixed model_provider = \"amazon-bedrock\" line — so plain codex defaults to Bedrock (no wrapper command). While Bedrock is enabled, the block is hash-gated: once a dev edits anything inside it, converge leaves the file alone; an unedited block is re-rendered in place. Disabling Bedrock removes its routing while preserving personal Codex defaults. A non-empty map also removes the legacy ~/.codex/bedrock.config.toml. Empty map seeds no block."
   type        = map(string)
   default = {
     model = "openai.gpt-5.6-terra"

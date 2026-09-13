@@ -175,10 +175,24 @@ case "$*" in
     echo active
     ;;
   "is-enabled --quiet earlyoom")
-    if [ -f "$DEVBOX_TEST_STATE_DIR/earlyoom-disabled" ]; then
+    if [ -f "$DEVBOX_TEST_STATE_DIR/earlyoom-disabled" ] \
+      || [ "${FAKE_EARLYOOM_INSTALLED:-1}" = 0 ]; then
       exit 1
     fi
     exit "${FAKE_EARLYOOM_ENABLED_RC:-0}"
+    ;;
+  "is-enabled --quiet systemd-oomd")
+    exit "${FAKE_OOMD_ENABLED_RC:-0}"
+    ;;
+  "show earlyoom -p LoadState --value")
+    if [ "${FAKE_EARLYOOM_LOAD_STATE_RC:-0}" -ne 0 ]; then
+      exit "$FAKE_EARLYOOM_LOAD_STATE_RC"
+    fi
+    if [ -f "$DEVBOX_TEST_STATE_DIR/earlyoom-masked" ]; then
+      echo masked
+    else
+      echo loaded
+    fi
     ;;
   "show earlyoom -p MainPID --value")
     if [ "${FAKE_EARLYOOM_MAIN_PID_QUERY_RC:-0}" -ne 0 ]; then
@@ -526,8 +540,46 @@ test_noop_skips_sysctl_set_property_and_restart() {
   assert_log_absent "$workdir/commands.log" "apt-get install -y earlyoom"
   assert_log_absent "$workdir/commands.log" "systemctl mask earlyoom"
   assert_log_absent "$workdir/commands.log" "systemctl restart earlyoom"
+  assert_log_absent "$workdir/commands.log" "systemctl unmask earlyoom"
+  assert_log_absent "$workdir/commands.log" "systemctl enable --now earlyoom"
+  assert_log_absent "$workdir/commands.log" "systemctl enable systemd-oomd"
   [ ! -e "$workdir/test-state/earlyoom-masked" ] \
     || fail "held steady-state earlyoom must never be left masked"
+}
+
+test_service_state_drift_is_repaired() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  setup_workdir "$workdir"
+  seed_converged_earlyoom "$workdir"
+  touch "$workdir/test-state/earlyoom-masked" "$workdir/test-state/earlyoom-disabled"
+
+  FAKE_OOMD_ENABLED_RC=1 run_hotfix "$workdir" >"$workdir/hotfix.out"
+
+  assert_log_order "$workdir/commands.log" "systemctl unmask earlyoom" "systemctl enable --now earlyoom"
+  assert_log_contains "$workdir/commands.log" "systemctl enable systemd-oomd"
+  [ ! -e "$workdir/test-state/earlyoom-masked" ] \
+    || fail "masked earlyoom must be unmasked"
+  [ ! -e "$workdir/test-state/earlyoom-disabled" ] \
+    || fail "disabled earlyoom must be enabled"
+  [ -f "$workdir/state/memory.env.sha256" ] \
+    || fail "service recovery must complete convergence"
+}
+
+test_earlyoom_load_state_query_failure_aborts_pre_handoff() {
+  local workdir rc=0
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  setup_workdir "$workdir"
+  seed_converged_earlyoom "$workdir"
+
+  FAKE_EARLYOOM_LOAD_STATE_RC=23 \
+    run_hotfix "$workdir" >"$workdir/hotfix.out" 2>&1 || rc=$?
+
+  [ "$rc" -eq 23 ] || fail "failed service state query must abort convergence"
+  [ ! -f "$workdir/etc/systemd/system/user@.service.d/50-devbox-oomd.conf" ] \
+    || fail "failed service state query must leave the old responder intact"
 }
 
 # Fleet root disks: 120G, ~72G avail with the old 32G swapfile in place. A
@@ -1537,6 +1589,8 @@ run_test() {
 
 run_test test_assert_log_order_reports_missing_entries
 run_test test_noop_skips_sysctl_set_property_and_restart
+run_test test_service_state_drift_is_repaired
+run_test test_earlyoom_load_state_query_failure_aborts_pre_handoff
 run_test test_swap_resize_counts_existing_swapfile_as_reclaimable
 run_test test_swap_resize_skips_when_reclaim_still_insufficient
 run_test test_swap_creation_without_swapfile_reclaims_nothing
