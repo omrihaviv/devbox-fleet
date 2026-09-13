@@ -771,4 +771,304 @@ run_concern >/dev/null 2>&1 || true
 [ "$(cat "$cfg")" = "null" ] \
   || fail "concern overwrote a config that was valid JSON but not an object (e.g. null)"
 
+echo "== disabling Bedrock removes managed state and preserves personal config"
+cat > "$work/state/manifest.json" <<'EOF'
+{"schema":1,"scripts":{},"env":{},"bedrock":{"role_arn":"arn:aws:iam::123456789012:role/devbox-gcp-workload","region":"us-east-1","audience":"devbox-fleet-aws-federation","codex_config":{"model":"openai.gpt-5.6-terra","model_reasoning_effort":"xhigh"}}}
+EOF
+printf 'personal_unedited = "kept"\n' > "$work/home/.codex/config.toml"
+run_concern >/dev/null
+grep -qF 'model_provider = "amazon-bedrock"' "$work/home/.codex/config.toml" \
+  || fail "enable fixture did not seed the Codex Bedrock block"
+cat > "$work/state/manifest.json" <<'EOF'
+{"schema": 1, "scripts": {}, "env": {}}
+EOF
+rm -f "$cfg"
+run_concern >/dev/null
+grep -qxF 'personal_unedited = "kept"' "$work/home/.codex/config.toml" \
+  || fail "cleanup of an untouched block lost personal Codex config"
+if grep -qE 'devbox codex|amazon-bedrock|^(model|model_reasoning_effort)[[:space:]]*=' \
+    "$work/home/.codex/config.toml"; then
+  fail "cleanup retained an untouched fleet Codex block or its model pins"
+fi
+python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' \
+  "$work/home/.codex/config.toml" || fail "cleaned Codex config is invalid TOML"
+
+cat > "$work/home/.codex/config.toml" <<'EOF'
+personal_before = "kept"
+# >>> devbox bedrock >>> (managed by devbox-bedrock-config; edits inside are overwritten)
+model_provider = "amazon-bedrock"
+model = "fleet-model"
+# <<< devbox bedrock <<<
+personal_after = "kept-too"
+EOF
+run_concern >/dev/null
+grep -qxF 'personal_before = "kept"' "$work/home/.codex/config.toml" \
+  || fail "legacy Codex cleanup lost personal content before the block"
+grep -qxF 'personal_after = "kept-too"' "$work/home/.codex/config.toml" \
+  || fail "legacy Codex cleanup lost personal content after the block"
+if grep -qE 'devbox bedrock|amazon-bedrock|fleet-model' "$work/home/.codex/config.toml"; then
+  fail "cleanup retained the legacy Bedrock block in Codex config"
+fi
+
+cat > "$work/etc/claude-managed-settings.json" <<'EOF'
+{"awsCredentialExport":"/usr/local/bin/devbox-aws-creds","awsAuthRefresh":"/usr/local/bin/devbox-aws-refresh","personal":true}
+EOF
+cat > "$work/home/.aws/config" <<'EOF'
+[default]
+region = il-central-1
+
+[profile devbox-bedrock]
+region = us-east-1
+credential_process = /usr/local/bin/devbox-aws-creds
+
+[profile personal]
+region = eu-west-1
+EOF
+cat > "$work/home/.codex/config.toml" <<'EOF'
+# >>> devbox codex >>> (seeded by devbox-bedrock-config; yours to edit)
+# devbox-render: deliberately-edited
+# To default codex to your personal account instead: set
+# model_provider = "openai" and drop the model pins below —
+# converge respects any edit you make inside this block.
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
+personal_inside = "kept"
+  model_providers.amazon-bedrock.aws.profile = 'devbox-bedrock'
+ model_providers.amazon-bedrock.aws.region = "us-east-1" # stale fleet route
+# <<< devbox codex <<<
+personal_outside = "also-kept"
+EOF
+printf 'legacy\n' > "$work/home/.codex/bedrock.config.toml"
+cat > "$work/home/.bashrc" <<'EOF'
+alias ll='ls -la'
+# >>> devbox bedrock >>> (managed by devbox-bedrock-config; edits inside are overwritten)
+bclaude() { claude "$@"; }
+# <<< devbox bedrock <<<
+alias gs='git status'
+EOF
+printf '#!/bin/sh\n' > "$work/usr/local/bin/bclaude"
+printf '#!/bin/sh\n' > "$work/usr/local/bin/bdcc"
+chmod +x "$work/usr/local/bin/bclaude" "$work/usr/local/bin/bdcc"
+printf '{}\n' > "$work/etc/bedrock.json"
+mkdir -p "$work/home/.paseo"
+cat > "$cfg" <<'EOF'
+{"version":1,"agents":{"providers":{"claude":{"enabled":true},"bclaude":{"extends":"claude"}}},"personal":true}
+EOF
+chmod 0600 "$cfg"
+rm -f "$work/state/claude-code-installed"
+
+if DEVBOX_TEST_PASEO_RELOAD_FAIL=1 run_concern >/dev/null 2>&1; then
+  fail "a failed Paseo cleanup reload must fail the concern"
+fi
+[ ! -e "$work/etc/bedrock.json" ] || fail "disabled Bedrock retained bedrock.json"
+[ ! -e "$work/usr/local/bin/bclaude" ] || fail "disabled Bedrock retained bclaude"
+[ ! -e "$work/usr/local/bin/bdcc" ] || fail "disabled Bedrock retained bdcc"
+[ ! -e "$work/home/.codex/bedrock.config.toml" ] || fail "disabled Bedrock retained the legacy Codex profile"
+jq -e '.personal == true and (has("awsCredentialExport") | not) and (has("awsAuthRefresh") | not)' \
+  "$work/etc/claude-managed-settings.json" >/dev/null \
+  || fail "cleanup did not remove only the managed Claude credential hooks"
+grep -q '^\[default\]$' "$work/home/.aws/config" || fail "cleanup lost the default AWS profile"
+grep -q '^\[profile personal\]$' "$work/home/.aws/config" || fail "cleanup lost a personal AWS profile"
+if grep -q '^\[profile devbox-bedrock\]$' "$work/home/.aws/config"; then
+  fail "cleanup retained the managed Bedrock AWS profile"
+fi
+grep -qF "alias ll='ls -la'" "$work/home/.bashrc" || fail "cleanup lost personal bashrc content"
+grep -qF "alias gs='git status'" "$work/home/.bashrc" || fail "cleanup lost personal bashrc content after the block"
+if grep -qF 'devbox bedrock' "$work/home/.bashrc"; then
+  fail "cleanup retained the legacy bashrc block"
+fi
+for line in \
+  'model = "gpt-6-astra"' \
+  'model_reasoning_effort = "high"' \
+  'personal_inside = "kept"' \
+  'personal_outside = "also-kept"'; do
+  grep -qxF "$line" "$work/home/.codex/config.toml" \
+    || fail "cleanup lost personal Codex config: $line"
+done
+if grep -q 'amazon-bedrock' "$work/home/.codex/config.toml"; then
+  fail "cleanup retained fleet Codex Bedrock provider pins"
+fi
+jq -e '.personal == true and .agents.providers.claude.enabled == true
+       and (.agents.providers | has("bclaude") | not)' "$cfg" >/dev/null \
+  || fail "cleanup did not remove only the Paseo Bedrock provider"
+
+reloads_before="$(wc -l < "$work/paseo.log")"
+run_concern >/dev/null || fail "Paseo cleanup reload must recover on the next convergence"
+[ "$(wc -l < "$work/paseo.log")" -eq "$((reloads_before + 1))" ] \
+  || fail "unchanged disabled state did not retry the Paseo reload"
+
+personal_before="$(sha256sum "$work/etc/claude-managed-settings.json" "$work/home/.aws/config" \
+  "$work/home/.bashrc" "$work/home/.codex/config.toml" "$cfg" | sha256sum)"
+run_concern >/dev/null || fail "disabled convergence must be repeatable"
+personal_after="$(sha256sum "$work/etc/claude-managed-settings.json" "$work/home/.aws/config" \
+  "$work/home/.bashrc" "$work/home/.codex/config.toml" "$cfg" | sha256sum)"
+[ "$personal_before" = "$personal_after" ] \
+  || fail "disabled convergence changed already-clean personal files"
+
+echo "== edited personal Codex defaults remain valid when Bedrock is re-enabled"
+edited_codex_before="$(cat "$work/home/.codex/config.toml")"
+cat > "$work/state/manifest.json" <<'EOF'
+{"schema":1,"scripts":{},"env":{},"bedrock":{"role_arn":"arn:aws:iam::123456789012:role/devbox-gcp-workload","region":"us-east-1","audience":"devbox-fleet-aws-federation","codex_config":{"model":"openai.gpt-5.6-terra","model_reasoning_effort":"xhigh"}}}
+EOF
+run_concern >/dev/null
+[ "$(cat "$work/home/.codex/config.toml")" = "$edited_codex_before" ] \
+  || fail "re-enable overwrote edited personal Codex defaults"
+python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' \
+  "$work/home/.codex/config.toml" || fail "re-enabled edited Codex config has duplicate or invalid TOML"
+
+echo "== edited Amazon provider syntax variants are removed"
+cat > "$work/state/manifest.json" <<'EOF'
+{"schema":1,"scripts":{},"env":{}}
+EOF
+cat > "$work/home/.codex/config.toml" <<'EOF'
+# >>> devbox codex >>> (seeded by devbox-bedrock-config; yours to edit)
+# devbox-render: deliberately-edited
+  model_provider = 'amazon-bedrock' # local formatting
+ model = "fleet-model"
+  model_reasoning_effort = 'xhigh'
+ personal_inside = "kept"
+   model_providers.amazon-bedrock.aws.profile = 'devbox-bedrock'
+ model_providers.amazon-bedrock.aws.region = "us-east-1" # stale
+# <<< devbox codex <<<
+personal_outside = "kept-too"
+EOF
+run_concern >/dev/null
+if grep -qE 'amazon-bedrock|fleet-model|model_reasoning_effort' "$work/home/.codex/config.toml"; then
+  fail "cleanup missed whitespace, quote, or trailing-comment Bedrock routing variants"
+fi
+grep -qF 'personal_inside = "kept"' "$work/home/.codex/config.toml" \
+  || fail "syntax-variant cleanup lost personal content inside the edited block"
+grep -qxF 'personal_outside = "kept-too"' "$work/home/.codex/config.toml" \
+  || fail "syntax-variant cleanup lost personal content outside the edited block"
+
+echo "== malformed managed settings and Paseo configs fail cleanup without mutation"
+printf '{broken-managed\n' > "$work/etc/claude-managed-settings.json"
+invalid_before="$(sha256sum "$work/etc/claude-managed-settings.json")"
+if run_concern >/dev/null 2>&1; then
+  fail "malformed managed settings must fail disabled cleanup"
+fi
+[ "$(sha256sum "$work/etc/claude-managed-settings.json")" = "$invalid_before" ] \
+  || fail "failed cleanup changed malformed managed settings"
+printf '{}\n' > "$work/etc/claude-managed-settings.json"
+printf 'null\n' > "$cfg"
+invalid_before="$(sha256sum "$cfg")"
+if run_concern >/dev/null 2>&1; then
+  fail "non-object Paseo config must fail disabled cleanup"
+fi
+[ "$(sha256sum "$cfg")" = "$invalid_before" ] \
+  || fail "failed cleanup changed the non-object Paseo config"
+rm -f "$cfg"
+
+echo "== missing or malformed manifests never trigger destructive cleanup"
+printf '{}\n' > "$work/etc/bedrock.json"
+rm -f "$work/state/manifest.json"
+run_concern >/dev/null
+[ -e "$work/etc/bedrock.json" ] || fail "missing manifest triggered Bedrock cleanup"
+printf '{not-json\n' > "$work/state/manifest.json"
+if run_concern >/dev/null 2>&1; then
+  fail "malformed manifest must fail closed"
+fi
+[ -e "$work/etc/bedrock.json" ] || fail "malformed manifest triggered Bedrock cleanup"
+printf '{"schema":1,"bedrock":"invalid"}\n' > "$work/state/manifest.json"
+if run_concern >/dev/null 2>&1; then
+  fail "malformed Bedrock object must fail closed"
+fi
+[ -e "$work/etc/bedrock.json" ] || fail "malformed Bedrock object triggered cleanup"
+
+echo "== cleanup preserves TOML structure and rejects unsafe input before mutation"
+python3 - "$CONCERN" <<'PY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
+import tomllib
+
+start = '# >>> devbox codex >>> (seeded by devbox-bedrock-config; yours to edit)'
+end = '# <<< devbox codex <<<'
+legacy_start = '# >>> devbox bedrock >>> (managed by devbox-bedrock-config; edits inside are overwritten)'
+legacy_end = '# <<< devbox bedrock <<<'
+edited = start + '\n# devbox-render: edited\n'
+failures = []
+
+def check(name, config, *, refuse=False, bashrc=None, paseo='{}'):
+    with TemporaryDirectory(prefix='bedrock-cleanup-test-') as directory:
+        root = Path(directory)
+        home, state, etc, bins = [root / name for name in ('home', 'state', 'etc', 'bin')]
+        for path in (home / '.codex', home / '.aws', home / '.paseo', state, etc, bins):
+            path.mkdir(parents=True)
+        files = {
+            state / 'manifest.json': '{"schema":1,"scripts":{},"env":{}}',
+            etc / 'bedrock.json': '{"role_arn":"keep-on-failure"}',
+            etc / 'managed.json': '{"awsCredentialExport":"/usr/local/bin/devbox-aws-creds","personal":true}',
+            bins / 'bclaude': 'managed wrapper\n',
+            bins / 'bdcc': 'managed wrapper\n',
+            home / '.codex/bedrock.config.toml': 'legacy = true\n',
+            home / '.codex/config.toml': config,
+            home / '.aws/config': '[profile devbox-bedrock]\nregion = us-east-1\n',
+            home / '.bashrc': bashrc if bashrc is not None else 'alias ll="ls -la"\n',
+            home / '.paseo/config.json': paseo,
+        }
+        for path, content in files.items():
+            path.write_text(content)
+        before = {path: path.read_bytes() for path in files}
+        env = os.environ | {
+            'DEVBOX_SKIP_ROOT_CHECK': '1',
+            'DEVBOX_DEV_HOME': str(home),
+            'DEVBOX_RUNTIME_STATE_DIR': str(state),
+            'DEVBOX_BEDROCK_CONFIG': str(etc / 'bedrock.json'),
+            'DEVBOX_CLAUDE_MANAGED_SETTINGS': str(etc / 'managed.json'),
+            'DEVBOX_BCLAUDE_BIN': str(bins / 'bclaude'),
+            'DEVBOX_BDCC_BIN': str(bins / 'bdcc'),
+            'DEVBOX_PASEO_BIN': str(bins / 'paseo'),
+            'DEVBOX_PASEO_CONFIG_FILE': str(home / '.paseo/config.json'),
+        }
+        result = subprocess.run(['bash', sys.argv[1]], env=env, capture_output=True, text=True)
+        try:
+            if refuse:
+                assert result.returncode != 0, 'unsafe input was accepted'
+                after = {path: path.read_bytes() if path.exists() else None for path in files}
+                assert after == before, 'refused cleanup changed existing state'
+            else:
+                assert result.returncode == 0, result.stderr
+                cleaned = tomllib.loads((home / '.codex/config.toml').read_text())
+                assert cleaned == {
+                    'personal': 'first\nsecond',
+                    'profiles': {'personal': {'model': 'personal-model', 'model_reasoning_effort': 'high'}},
+                }, f'personal settings changed: {cleaned!r}'
+                assert not (etc / 'bedrock.json').exists(), 'cleanup did not disable Bedrock'
+        except (AssertionError, tomllib.TOMLDecodeError) as error:
+            failures.append(f'{name}: {error}')
+
+check('multiline model and personal profile', edited + '''model_provider = "amazon-bedrock"
+model = """
+fleet-model
+"""
+personal = """first
+second"""
+model_providers.amazon-bedrock.aws.profile = "devbox-bedrock"
+[profiles.personal]
+model = "personal-model"
+model_reasoning_effort = "high"
+''' + end + '\n')
+check('malformed TOML', edited + 'model = "unterminated\n' + end + '\n', refuse=True)
+check('missing legacy end marker', legacy_start + '\npersonal = "keep"\n', refuse=True)
+check('duplicate current markers', edited + end + '\n' + edited + end + '\n', refuse=True)
+check('unmatched bashrc marker', 'personal = "keep"\n',
+      bashrc='alias ll="ls -la"\n' + legacy_start + '\nalias gs="git status"\n', refuse=True)
+check('duplicate bashrc markers', 'personal = "keep"\n',
+      bashrc=(legacy_start + '\n' + legacy_end + '\n') * 2, refuse=True)
+check('edited provider map under its parent table', edited + '''model_provider = "amazon-bedrock"
+model = "fleet-model"
+[model_providers]
+amazon-bedrock = {name = "Amazon Bedrock", aws = {profile = "devbox-bedrock"}}
+''' + end + '\n', refuse=True)
+for invalid in ('{"agents":17}', '{"agents":{"providers":[]}}'):
+    check('invalid Paseo provider structure ' + invalid, 'personal = "keep"\n', paseo=invalid, refuse=True)
+if failures:
+    for failure in failures:
+        print('FAIL: ' + failure, file=sys.stderr)
+    raise SystemExit(1)
+PY
+
 echo "PASS: devbox-bedrock-config-test"

@@ -296,6 +296,22 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
   DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
     scripts/gcp/promote-runtime.sh "$SHA"                               # fleet converges within ~9h
   ```
+- **Disable the fleet's Bedrock setup.** Set `bedrock_role_arn = ""` in
+  `gcp/terraform.tfvars`, then use the runtime canary → promote flow above.
+  Convergence removes the managed Codex Bedrock defaults, legacy Codex profile
+  file, `devbox-bedrock` AWS profile, `/etc/devbox/bedrock.json`, Claude's
+  fleet credential hooks, `bclaude`/`bdcc`, their legacy shell functions, and
+  Paseo's `bclaude` provider. Personal settings and personal Codex model choices
+  survive. Cleanup also runs when Claude's installation marker is absent.
+  Verify the canary has no managed Bedrock provider in `~/.codex/config.toml`,
+  no `devbox-bedrock` section in `~/.aws/config`, no `bclaude`/`bdcc` executables,
+  and no `agents.providers.bclaude` in `~/.paseo/config.json`. After promotion,
+  force immediate cleanup with `scripts/gcp/sync-converge.sh <key> [<key> ...]`
+  for every fleet machine, or let their timers converge within ~9h. Start new
+  shells to discard any old shell functions. Existing agent sessions can retain
+  temporary AWS credentials; this setting removes client configuration and
+  does not revoke the AWS role's IAM trust. The optional `aws-federation/` root
+  remains available; restore its role ARN and roll out again to re-enable.
 - **Resize `machine_type`.** Change it in tfvars, `terraform -chdir=gcp apply`. `allow_stopping_for_update = true` stops and restarts the instance in place — NOT a rebuild (no generation bump, no key rotation, data disk untouched).
 - **Grow the data disk.** Raise `data_disk_gb` in tfvars (grow-only — GCE rejects shrinks), `terraform -chdir=gcp apply`, then extend the filesystem on the box:
   ```bash
@@ -379,10 +395,11 @@ That marker is a cache of a live contract check (regular file, dev-owned,
 executable, version 2.1.255 or newer), recomputed every converge and **deleted
 before any repair attempt**. So an absent marker means claude is currently
 broken on that box, and three things deliberately stop: the old-install
-cleanup, the agent-plugins concern, and every Bedrock-side action in
+cleanup, the agent-plugins concern, and Bedrock setup in
 `devbox-bedrock-config` (the `bclaude`/`bdcc` wrappers, the `~/.bashrc`
 retirement, and the Paseo provider). A box in that state keeps working on
-whatever claude it already had.
+whatever claude it already had. Disabling the fleet's Bedrock setup still
+removes its managed configuration regardless of this marker.
 
 Verify a box:
 

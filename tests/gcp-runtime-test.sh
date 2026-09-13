@@ -60,7 +60,7 @@ assert_contains 'devbox-aws-creds'
 assert_contains 'uniform_bucket_level_access = true'
 assert_contains 'roles/storage.objectViewer'
 
-# Bedrock keys must be optional (absent → concern no-op).
+# Bedrock keys must be optional (absent → concern removes managed setup).
 assert_contains 'var.bedrock_role_arn == ""'
 
 # VS Code is installed only by the new-machine toolchain gate, but its

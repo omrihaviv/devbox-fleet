@@ -29,7 +29,8 @@
 #                                         success marker, then live-reloaded
 #                                         without restarting the daemon when
 #                                         its CLI supports reload)
-# NO-OP when the manifest has no .bedrock object — plumbing lands first.
+# A valid manifest with no .bedrock object removes the managed state above;
+# a missing or malformed manifest leaves existing state untouched.
 # Never touches ~/.claude/settings.json.
 set -euo pipefail
 
@@ -39,6 +40,8 @@ BEDROCK_CONFIG="${DEVBOX_BEDROCK_CONFIG:-/etc/devbox/bedrock.json}"
 MANIFEST="$STATE_DIR/manifest.json"
 MARK_START="# >>> devbox bedrock >>> (managed by devbox-bedrock-config; edits inside are overwritten)"
 MARK_END="# <<< devbox bedrock <<<"
+CODEX_MARK_START="# >>> devbox codex >>> (seeded by devbox-bedrock-config; yours to edit)"
+CODEX_MARK_END="# <<< devbox codex <<<"
 
 CLAUDE_SUCCESS_FILE="${DEVBOX_CLAUDE_SUCCESS_FILE:-/var/lib/devbox-runtime/claude-code-installed}"
 CLAUDE_BIN="${DEVBOX_CLAUDE_BIN:-$DEV_HOME/.local/bin/claude}"
@@ -68,15 +71,6 @@ if [ "${DEVBOX_SKIP_ROOT_CHECK:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-if [ ! -f "$MANIFEST" ] || ! jq -e '.bedrock.role_arn' "$MANIFEST" >/dev/null 2>&1; then
-  echo "devbox-bedrock-config: no bedrock keys in manifest; nothing to do"
-  exit 0
-fi
-
-role_arn="$(jq -re .bedrock.role_arn "$MANIFEST")"
-region="$(jq -re .bedrock.region "$MANIFEST")"
-audience="$(jq -re .bedrock.audience "$MANIFEST")"
-
 dev_owner="$(stat -c %U "$DEV_HOME" 2>/dev/null || echo dev)"
 
 install_as_dev() { # path mode content-file
@@ -91,6 +85,256 @@ run_as_dev() {
     sudo -u "$dev_owner" -H env HOME="$DEV_HOME" "$@"
   fi
 }
+
+prepare_bedrock_text_cleanup() { # output directory; no existing files are changed
+  python3 - "$DEV_HOME" "$1" "$MARK_START" "$MARK_END" \
+      "$CODEX_MARK_START" "$CODEX_MARK_END" <<'PY'
+import copy
+import hashlib
+from pathlib import Path
+import sys
+import tomllib
+
+home, output = map(Path, sys.argv[1:3])
+legacy_start, legacy_end, codex_start, codex_end = sys.argv[3:]
+
+def block_bounds(lines, start, end):
+    starts = [i for i, line in enumerate(lines) if line.rstrip('\r\n') == start]
+    ends = [i for i, line in enumerate(lines) if line.rstrip('\r\n') == end]
+    if not starts and not ends:
+        return None
+    if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        raise ValueError('unmatched or duplicate managed block markers')
+    return starts[0], ends[0]
+
+def statements(lines):
+    # Let tomllib identify complete assignments, including multiline values.
+    # Keep original text and offsets; this is not a TOML serializer.
+    first = 0
+    for last in range(1, len(lines) + 1):
+        try:
+            values = tomllib.loads(''.join(lines[first:last]))
+        except tomllib.TOMLDecodeError:
+            continue
+        yield first, last, values, lines[first].lstrip().startswith('[')
+        first = last
+    if first != len(lines):
+        raise ValueError('managed block splits a TOML statement')
+
+def remove_values(target, removed):
+    for key, value in removed.items():
+        if isinstance(value, dict) and value:
+            remove_values(target[key], value)
+            if not target[key]:
+                del target[key]
+        else:
+            del target[key]
+
+try:
+    bashrc = home / '.bashrc'
+    if bashrc.is_file():
+        with bashrc.open(encoding='utf-8', newline='') as source:
+            lines = source.readlines()
+        bounds = block_bounds(lines, legacy_start, legacy_end)
+        if bounds:
+            first, last = bounds
+            del lines[first:last + 1]
+        (output / 'bashrc').write_text(''.join(lines))
+
+    config = home / '.codex/config.toml'
+    if config.is_file():
+        with config.open(encoding='utf-8', newline='') as source:
+            lines = source.readlines()
+        expected = copy.deepcopy(tomllib.loads(''.join(lines)))
+        blocks = [(block_bounds(lines, start, end), start == legacy_start)
+                  for start, end in ((legacy_start, legacy_end), (codex_start, codex_end))]
+        blocks = sorted((bounds, legacy) for bounds, legacy in blocks if bounds)
+        excluded = set()
+        previous_end = -1
+        for (first, last), legacy in blocks:
+            if first <= previous_end:
+                raise ValueError('overlapping managed block markers')
+            previous_end = last
+            # Blocks seeded by the fleet are at the root. A moved block or a
+            # marker inside a multiline value is ambiguous: leave it intact.
+            prefix = list(statements(lines[:first]))
+            if any(table for _, _, _, table in prefix):
+                raise ValueError('managed Codex block follows a TOML table')
+            body = lines[first + 1:last]
+            entries = list(statements(body))
+            rendered = ''.join(line for line in body if not line.startswith('# devbox-render: ')).rstrip('\n') + '\n'
+            hashes = [line.removeprefix('# devbox-render: ').strip()
+                      for line in body if line.startswith('# devbox-render: ')]
+            untouched = len(hashes) == 1 and hashlib.sha256(rendered.encode()).hexdigest() == hashes[0]
+            if legacy or untouched:
+                remove_values(expected, tomllib.loads(''.join(body)))
+                excluded.update(range(first, last + 1))
+                continue
+
+            root_entries = []
+            in_table = False
+            for begin, finish, values, table in entries:
+                in_table |= table
+                if table and 'amazon-bedrock' in values.get('model_providers', {}):
+                    raise ValueError('edited Bedrock provider table needs manual cleanup')
+                if not in_table:
+                    root_entries.append((begin, finish, values))
+            drop_model = any(values.get('model_provider') == 'amazon-bedrock'
+                             for _, _, values in root_entries)
+            for begin, finish, values in root_entries:
+                providers = values.get('model_providers', {})
+                bedrock_route = isinstance(providers, dict) and 'amazon-bedrock' in providers
+                if bedrock_route and set(providers) != {'amazon-bedrock'}:
+                    raise ValueError('mixed inline provider settings need manual cleanup')
+                if (bedrock_route or values.get('model_provider') == 'amazon-bedrock'
+                        or (drop_model and set(values) & {'model', 'model_reasoning_effort'})):
+                    remove_values(expected, values)
+                    excluded.update(range(first + 1 + begin, first + 1 + finish))
+            remaining = tomllib.loads(''.join(line for i, line in enumerate(body, first + 1)
+                                             if i not in excluded))
+            providers = remaining.get('model_providers', {})
+            if (remaining.get('model_provider') == 'amazon-bedrock'
+                    or (isinstance(providers, dict) and 'amazon-bedrock' in providers)):
+                raise ValueError('edited block retains Bedrock routing; manual cleanup required')
+
+        cleaned = ''.join(line for i, line in enumerate(lines) if i not in excluded)
+        if tomllib.loads(cleaned) != expected:
+            raise ValueError('cleanup would change personal TOML settings or table scope')
+        (output / 'codex').write_text(cleaned)
+except (OSError, ValueError, KeyError, TypeError):
+    print('FATAL: unsafe or malformed shell/Codex config; leaving existing state unchanged', file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+reload_paseo_config() {
+  if [ ! -x "$PASEO_BIN" ]; then
+    return 0
+  fi
+  local paseo_help
+  if ! paseo_help="$(run_as_dev "$PASEO_BIN" --help)"; then
+    echo "devbox-bedrock-config: failed to inspect Paseo CLI capabilities" >&2
+    return 1
+  fi
+  if grep -qE '^[[:space:]]+reload([[:space:]]|$)' <<< "$paseo_help"; then
+    if ! run_as_dev "$PASEO_BIN" reload --json >/dev/null; then
+      echo "devbox-bedrock-config: failed to reload Paseo daemon config" >&2
+      return 1
+    fi
+  else
+    echo "WARN: installed Paseo has no reload command; restart Paseo to load provider changes" >&2
+  fi
+}
+
+cleanup_bedrock() {
+  local aws_config bashrc codex_cfg managed_settings tmp prepared
+
+  managed_settings="${DEVBOX_CLAUDE_MANAGED_SETTINGS:-/etc/claude-code/managed-settings.json}"
+  if [ -f "$managed_settings" ] \
+      && ! jq -e 'type == "object"' "$managed_settings" >/dev/null 2>&1; then
+    echo "FATAL: Claude managed settings are malformed; leaving existing state unchanged" >&2
+    return 1
+  fi
+  if [ -f "$PASEO_CONFIG_FILE" ] \
+      && ! jq -e 'type == "object" and (del(.agents.providers.bclaude) | type == "object")' \
+        "$PASEO_CONFIG_FILE" >/dev/null 2>&1; then
+    echo "FATAL: Paseo config is malformed; leaving existing state unchanged" >&2
+    return 1
+  fi
+
+  prepared="$(mktemp -d)"
+  if ! prepare_bedrock_text_cleanup "$prepared"; then
+    rm -rf "$prepared"
+    return 1
+  fi
+
+  rm -f "$BEDROCK_CONFIG" "$BCLAUDE_BIN" "$BDCC_BIN" \
+    "$DEV_HOME/.codex/bedrock.config.toml"
+
+  if [ -f "$managed_settings" ] \
+      && jq -e 'type == "object"' "$managed_settings" >/dev/null 2>&1; then
+    tmp="$(mktemp)"
+    jq '
+      if .awsCredentialExport == "/usr/local/bin/devbox-aws-creds"
+      then del(.awsCredentialExport) else . end
+      | if .awsAuthRefresh == "/usr/local/bin/devbox-aws-refresh"
+        then del(.awsAuthRefresh) else . end
+    ' "$managed_settings" > "$tmp"
+    if ! cmp -s "$tmp" "$managed_settings"; then
+      install -m 0644 "$tmp" "$managed_settings"
+    fi
+    rm -f "$tmp"
+  fi
+
+  aws_config="$DEV_HOME/.aws/config"
+  if [ -f "$aws_config" ]; then
+    tmp="$(mktemp)"
+    awk '
+      /^\[profile devbox-bedrock\]$/ { skip = 1; next }
+      /^\[/ && skip { skip = 0 }
+      !skip { print }
+    ' "$aws_config" > "$tmp"
+    if ! cmp -s "$tmp" "$aws_config"; then
+      install_as_dev "$aws_config" 0644 "$tmp"
+    fi
+    rm -f "$tmp"
+  fi
+
+  bashrc="$DEV_HOME/.bashrc"
+  if [ -f "$prepared/bashrc" ] && ! cmp -s "$prepared/bashrc" "$bashrc"; then
+    install_as_dev "$bashrc" 0644 "$prepared/bashrc"
+  fi
+
+  codex_cfg="$DEV_HOME/.codex/config.toml"
+  if [ -f "$prepared/codex" ] && ! cmp -s "$prepared/codex" "$codex_cfg"; then
+    install_as_dev "$codex_cfg" 0644 "$prepared/codex"
+  fi
+  rm -rf "$prepared"
+
+  if [ -f "$PASEO_CONFIG_FILE" ] \
+      && jq -e 'type == "object"' "$PASEO_CONFIG_FILE" >/dev/null 2>&1; then
+    tmp="$(mktemp "$(dirname "$PASEO_CONFIG_FILE")/.config.json.XXXXXX")"
+    if jq 'del(.agents.providers.bclaude)' "$PASEO_CONFIG_FILE" > "$tmp"; then
+      if ! cmp -s "$tmp" "$PASEO_CONFIG_FILE"; then
+        chown "$dev_owner:$dev_owner" "$tmp" 2>/dev/null || true
+        chmod 0600 "$tmp"
+        mv -f "$tmp" "$PASEO_CONFIG_FILE"
+      fi
+    else
+      echo "devbox-bedrock-config: paseo provider cleanup failed; config left unchanged" >&2
+      rm -f "$tmp"
+      return 1
+    fi
+    rm -f "$tmp"
+    # Retry even after the provider is already absent: a prior atomic write may
+    # have succeeded while its live reload failed.
+    reload_paseo_config || return 1
+  fi
+
+  echo "devbox-bedrock-config: disabled; managed Bedrock state removed"
+}
+
+if [ ! -f "$MANIFEST" ]; then
+  echo "devbox-bedrock-config: manifest absent; leaving existing state unchanged"
+  exit 0
+fi
+if ! jq -e 'type == "object" and .schema == 1' "$MANIFEST" >/dev/null 2>&1; then
+  echo "FATAL: runtime manifest is malformed; leaving existing state unchanged" >&2
+  exit 1
+fi
+if ! jq -e 'has("bedrock")' "$MANIFEST" >/dev/null; then
+  cleanup_bedrock
+  exit $?
+fi
+if ! jq -e '.bedrock | type == "object" and (.role_arn | type == "string" and length > 0)' \
+    "$MANIFEST" >/dev/null 2>&1; then
+  echo "FATAL: manifest bedrock object is malformed; leaving existing state unchanged" >&2
+  exit 1
+fi
+
+role_arn="$(jq -re .bedrock.role_arn "$MANIFEST")"
+region="$(jq -re .bedrock.region "$MANIFEST")"
+audience="$(jq -re .bedrock.audience "$MANIFEST")"
 
 # ----- 1. /etc/devbox/bedrock.json -----
 install -d -m 0755 "$(dirname "$BEDROCK_CONFIG")"
@@ -159,8 +403,6 @@ rm -f "$tmp_cfg" "$tmp_cfg.new"
 # PREPENDED and still dotted provider keys: top-level keys appended after
 # a user [table] would join that table, and a table of ours could capture
 # user keys below the block.
-CODEX_MARK_START="# >>> devbox codex >>> (seeded by devbox-bedrock-config; yours to edit)"
-CODEX_MARK_END="# <<< devbox codex <<<"
 if jq -e '.bedrock.codex_config | length > 0' "$MANIFEST" >/dev/null 2>&1; then
   install -d -m 0755 "$DEV_HOME/.codex"
   chown "$dev_owner:$dev_owner" "$DEV_HOME/.codex" 2>/dev/null || true
