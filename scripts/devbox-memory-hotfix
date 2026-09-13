@@ -299,7 +299,9 @@ EOF
     systemctl daemon-reload
   fi
 
-  systemctl enable systemd-oomd
+  if ! systemctl is-enabled --quiet systemd-oomd; then
+    systemctl enable systemd-oomd
+  fi
 
   oomd_active=true
   if ! systemctl is-active --quiet systemd-oomd; then
@@ -686,7 +688,7 @@ earlyoom_txn_fail() {
 }
 
 converge_earlyoom() {
-  local desired changed=false installed=false expected_args
+  local desired changed=false installed=false expected_args load_state
 
   earlyoom_armed=false
   earlyoom_snapshot=""
@@ -740,11 +742,18 @@ converge_earlyoom() {
   fi
   rm -f "$desired"
 
-  systemctl unmask earlyoom
+  # Even no-op unmask/enable commands reload systemd and reschedule timers.
+  load_state="$(systemctl show earlyoom -p LoadState --value)"
+  if [ "$load_state" = masked ]; then
+    systemctl unmask earlyoom
+  fi
   if [ "$changed" = true ] && systemctl is-active --quiet earlyoom; then
     systemctl restart earlyoom
   fi
-  systemctl enable --now earlyoom
+  if ! systemctl is-enabled --quiet earlyoom \
+    || ! systemctl is-active --quiet earlyoom; then
+    systemctl enable --now earlyoom
+  fi
   earlyoom_assert "$expected_args"
   if [ -n "$earlyoom_snapshot" ]; then
     rm -f "$earlyoom_snapshot"

@@ -189,7 +189,35 @@ download_dearmored_keyring() {
 
 apt_update_if_needed() {
   if [ "$apt_needs_update" = true ] || [ "$apt_updated" = false ]; then
-    "${APT_GET[@]}" update
+    # DPkg::Lock::Timeout covers install locks, not apt-get update's lists
+    # lock. Ubuntu's apt-daily can acquire that lock between any check and
+    # update, so handle only APT's explicit contention result, with a deadline.
+    # Never remove locks or retry repository, permission, or other failures.
+    local errors rc deadline=$((SECONDS + 300))
+    errors="$(mktemp)"
+    while :; do
+      if LC_ALL=C "${APT_GET[@]}" update 2>"$errors"; then
+        cat "$errors" >&2
+        rm -f "$errors"
+        break
+      else
+        rc=$?
+      fi
+      cat "$errors" >&2
+      if [ "$rc" -ne 100 ] \
+          || ! grep -Eq '^E: Could not get lock .*\. It is held by process [0-9]+ \(.*\)$' "$errors" \
+          || { grep '^E:' "$errors" | grep -Ev '^E: (Could not get lock .*\. It is held by process [0-9]+ \(.*\)|Unable to lock directory .*)$' >/dev/null; }; then
+        rm -f "$errors"
+        return "$rc"
+      fi
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        echo 'ERROR: timed out waiting for the APT package-list lock (300s)' >&2
+        rm -f "$errors"
+        return "$rc"
+      fi
+      echo 'apt update: waiting for another package refresh to release its lock' >&2
+      sleep 5
+    done
     apt_updated=true
     apt_needs_update=false
   fi
@@ -281,7 +309,10 @@ ensure_tailscale_package() {
     ensure_apt_package_version tailscale "$DEVBOX_TAILSCALE_VERSION"
   fi
 
-  systemctl enable --now tailscaled
+  if ! systemctl is-enabled --quiet tailscaled \
+    || ! systemctl is-active --quiet tailscaled; then
+    systemctl enable --now tailscaled
+  fi
 }
 
 ensure_gh() {
@@ -343,7 +374,10 @@ ensure_docker() {
   ensure_apt_package docker-compose-plugin
 
   usermod -aG docker "$DEV_USER"
-  systemctl enable --now docker
+  if ! systemctl is-enabled --quiet docker \
+    || ! systemctl is-active --quiet docker; then
+    systemctl enable --now docker
+  fi
 }
 
 ensure_system_node() {
@@ -675,7 +709,7 @@ ensure_codex_connectors_file() {
 }
 
 ensure_paseo_daemon() {
-  local runner_tmp service_tmp
+  local runner_tmp service_tmp service_changed=false load_state needs_reload
 
   # The runtime-managed GCP fleet owns this service lifecycle. Boxes outside it
   # (no runtime-bucket file) stay unchanged even if one happens to carry a
@@ -723,15 +757,22 @@ ensure_paseo_daemon() {
       rm -f "$runner_tmp" "$service_tmp"
       return 1
     fi
+    service_changed=true
   fi
   rm -f "$runner_tmp" "$service_tmp"
 
-  # Always reload, even when the rendered files are unchanged. A prior reload
-  # may have failed after the files landed; the next convergence must retry it.
-  if ! systemctl daemon-reload; then
-    return 1
+  # Check systemd's loaded state as well as file changes: a prior reload may
+  # have failed after writing the unit, so unchanged files can still be stale.
+  load_state="$(systemctl show paseo.service -p LoadState --value)" || return 1
+  needs_reload="$(systemctl show paseo.service -p NeedDaemonReload --value)" || return 1
+  if [ "$service_changed" = true ] || [ "$load_state" = not-found ] \
+    || [ "$needs_reload" = yes ]; then
+    systemctl daemon-reload || return 1
   fi
-  systemctl enable --now paseo.service
+  if ! systemctl is-enabled --quiet paseo.service \
+    || ! systemctl is-active --quiet paseo.service; then
+    systemctl enable --now paseo.service
+  fi
 }
 
 ensure_paseo() {

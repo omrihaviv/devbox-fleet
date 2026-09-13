@@ -141,6 +141,27 @@ echo "systemctl $*" >> "$DEVBOX_TEST_LOG"
 if [ "$*" = "daemon-reload" ] && [ "${DEVBOX_TEST_DAEMON_RELOAD_FAIL:-0}" = 1 ]; then
   exit 58
 fi
+case "$*" in
+  "daemon-reload")
+    if [ -f "${PASEO_DAEMON_SERVICE_FILE:-}" ]; then
+      cp "$PASEO_DAEMON_SERVICE_FILE" "$PASEO_DAEMON_SERVICE_FILE.loaded"
+    fi
+    ;;
+  "show paseo.service -p LoadState --value")
+    [ "${DEVBOX_TEST_SERVICE_QUERY_FAIL:-}" != LoadState ] || exit 59
+    if [ -f "$PASEO_DAEMON_SERVICE_FILE.loaded" ]; then echo loaded; else echo not-found; fi
+    ;;
+  "show paseo.service -p NeedDaemonReload --value")
+    [ "${DEVBOX_TEST_SERVICE_QUERY_FAIL:-}" != NeedDaemonReload ] || exit 59
+    if cmp -s "$PASEO_DAEMON_SERVICE_FILE" "$PASEO_DAEMON_SERVICE_FILE.loaded"; then echo no; else echo yes; fi
+    ;;
+  "is-enabled --quiet paseo.service"|"is-active --quiet paseo.service")
+    [ -f "$PASEO_DAEMON_SERVICE_FILE.enabled" ]
+    ;;
+  "enable --now paseo.service")
+    touch "$PASEO_DAEMON_SERVICE_FILE.enabled"
+    ;;
+esac
 EOF
   cat > "$fake_bin/mountpoint" <<'EOF'
 #!/usr/bin/env bash
@@ -937,6 +958,9 @@ test_matching_versions_are_noop() {
   fi
   if [ -f "$workdir/commands.log" ] && grep -q 'systemctl stop' "$workdir/commands.log"; then
     fail "already-mounted containerd dir should not trigger a migration"
+  fi
+  if grep -Eq '^systemctl enable --now (tailscaled|docker)$' "$workdir/commands.log"; then
+    fail "healthy Docker and Tailscale services must not implicitly reload systemd"
   fi
   [ "$(wc -l < "$workdir/fstab")" -eq 1 ] || fail "fstab entry should not be duplicated when already present"
 }
@@ -1989,7 +2013,7 @@ EOF
 }
 
 test_paseo_daemon_reload_failure_is_retryable() {
-  local workdir
+  local workdir property
   workdir="$(mktemp -d)"
   trap 'rm -rf "$workdir"' RETURN
 
@@ -2012,6 +2036,31 @@ test_paseo_daemon_reload_failure_is_retryable() {
     || fail "Paseo daemon reconciliation did not retry a failed systemd reload"
   grep -qxF 'systemctl enable --now paseo.service' "$workdir/commands.log" \
     || fail "Paseo daemon reconciliation did not enable the service after retry"
+
+  : > "$workdir/commands.log"
+  run_paseo_step "$workdir"
+  if grep -Eq '^systemctl (daemon-reload|enable|restart|stop)' "$workdir/commands.log"; then
+    fail "healthy Paseo must preserve its session without reloading systemd"
+  fi
+
+  # Unit was previously loaded, but a subsequent edit's reload failed.
+  printf '# stale loaded unit\n' > "$workdir/etc/systemd/system/paseo.service.loaded"
+  if DEVBOX_TEST_DAEMON_RELOAD_FAIL=1 run_paseo_step "$workdir"; then
+    fail "pending unit reload failure must fail convergence"
+  fi
+  run_paseo_step "$workdir"
+  [ "$(grep -cxF 'systemctl daemon-reload' "$workdir/commands.log")" -eq 2 ] \
+    || fail "unchanged unit files must retry a previously failed reload"
+
+  for property in LoadState NeedDaemonReload; do
+    : > "$workdir/commands.log"
+    if DEVBOX_TEST_SERVICE_QUERY_FAIL="$property" run_paseo_step "$workdir"; then
+      fail "failed $property query must fail convergence"
+    fi
+    if grep -Eq '^systemctl (daemon-reload|enable|restart|stop)' "$workdir/commands.log"; then
+      fail "failed state query must not mutate services"
+    fi
+  done
 }
 
 test_paseo_success_marker_leaves_preinstalled_box_alone() {
