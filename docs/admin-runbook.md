@@ -312,6 +312,21 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
   temporary AWS credentials; this setting removes client configuration and
   does not revoke the AWS role's IAM trust. The optional `aws-federation/` root
   remains available; restore its role ARN and roll out again to re-enable.
+- **Enable or disable the Vercel AI Gateway wrappers.** Set
+  `vercel_ai_gateway = {}` (or `{ codex_model = "<provider>/<model>" }`) in
+  `gcp/terraform.tfvars` and roll out through the canary → promote flow above.
+  Convergence publishes `/usr/local/bin/vclaude` and `/usr/local/bin/vcodex`,
+  registers **Claude (Vercel Gateway)** and **Codex (Vercel Gateway)** in
+  Paseo, and pre-creates `~/.config/vercel-ai-gateway/api-key` empty at mode
+  0600. The key is per developer: mint one per dev in the Vercel dashboard (or
+  `vercel ai-gateway api-keys create`, with a budget), hand it over out of band,
+  and the dev pastes it into that file — nothing secret rides the manifest.
+  Plain `claude`/`codex`, `~/.claude/settings.json`, and `~/.codex/config.toml`
+  are untouched. Setting the variable back to `null` removes the wrappers and
+  Paseo providers on the next converge; the key file is left in place. Verify a
+  canary with `ls -l /usr/local/bin/vclaude /usr/local/bin/vcodex`,
+  `stat -c '%a %U' ~/.config/vercel-ai-gateway/api-key` (600 dev), and
+  `paseo provider ls` listing both gateway providers.
 - **Resize `machine_type`.** Change it in tfvars, `terraform -chdir=gcp apply`. `allow_stopping_for_update = true` stops and restarts the instance in place — NOT a rebuild (no generation bump, no key rotation, data disk untouched).
 - **Grow the data disk.** Raise `data_disk_gb` in tfvars (grow-only — GCE rejects shrinks), `terraform -chdir=gcp apply`, then extend the filesystem on the box:
   ```bash

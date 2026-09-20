@@ -57,6 +57,30 @@ agent. It appears only after you restart the managed daemon with
 plain **Claude** entry still uses your personal login, and **Codex** is
 already on Bedrock via `~/.codex/config.toml`.
 
+### Vercel AI Gateway (`vclaude` / `vcodex`)
+
+If your admin enabled the gateway wrappers, your box has **`vclaude`** and
+**`vcodex`**: the same Claude Code and Codex, routed through
+[Vercel AI Gateway](https://vercel.com/docs/ai-gateway) with your own gateway
+key instead of your personal login. Plain `claude` and `codex` are untouched.
+
+One-time setup — paste the key your admin gave you (it starts with `vck_`):
+
+```bash
+echo 'vck_...' > ~/.config/vercel-ai-gateway/api-key
+```
+
+The file already exists, empty, at mode 600. Until it holds a key, `vclaude`
+and `vcodex` exit with a hint. `vcodex` starts on the fleet's default gateway
+model; pick another with `-m provider/model`, or `/model` inside either tool.
+
+Paseo offers **Claude (Vercel Gateway)** and **Codex (Vercel Gateway)** next
+to the regular providers. Two caveats: claude.ai org connectors do not load in
+a `vclaude` session (a gateway token replaces the claude.ai login for that
+session), and choosing a model with `/model` in `vclaude` saves it as your
+default for plain `claude` too — press `s` in the picker for a session-only
+choice.
+
 ### Mosh and tmux
 
 `mosh dev@<your-name>-devbox` for roaming-tolerant sessions (e.g. iPhone over cellular). Mosh uses UDP; Tailscale tunnels it, so the firewall stays closed to the public internet.
