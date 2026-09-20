@@ -10,6 +10,7 @@ locals {
     "devbox-observability"  = "${path.module}/../scripts/gcp/devbox-observability"
     "devbox-bedrock-config" = "${path.module}/../scripts/gcp/devbox-bedrock-config"
     "devbox-aws-creds"      = "${path.module}/../scripts/gcp/devbox-aws-creds"
+    "devbox-vercel-gateway" = "${path.module}/../scripts/gcp/devbox-vercel-gateway"
   }
 
   devbox_runtime_script_sha256 = {
@@ -48,6 +49,8 @@ locals {
 
   # Bedrock object is OPTIONAL: empty role ARN → key omitted entirely →
   # devbox-bedrock-config removes any previously installed Bedrock setup.
+  # Likewise vercel_ai_gateway: null → key omitted → devbox-vercel-gateway
+  # removes the managed vclaude/vcodex wrappers and Paseo providers.
   runtime_manifest = merge(
     {
       schema = 1
@@ -67,6 +70,11 @@ locals {
         model_env        = var.bedrock_model_env
         available_models = var.bedrock_available_models
         codex_config     = var.bedrock_codex_config
+      }
+    },
+    var.vercel_ai_gateway == null ? {} : {
+      vercel_ai_gateway = {
+        codex_model = var.vercel_ai_gateway.codex_model
       }
     }
   )
