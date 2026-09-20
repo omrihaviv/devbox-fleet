@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# Vercel AI Gateway opt-in concern. Default `claude` and `codex` stay on the
+# dev's personal accounts; `vclaude` / `vcodex` run the same tools through
+# ai-gateway.vercel.sh with the dev's OWN gateway key. Delivers:
+#   - ~/.config/vercel-ai-gateway/api-key  (created EMPTY, 0600, dev-owned:
+#                                          the dev pastes their key in. Never
+#                                          overwritten, never removed -- it is
+#                                          the dev's secret, not fleet state)
+#   - /usr/local/bin/vclaude               (root-owned executables, not shell
+#     /usr/local/bin/vcodex                 functions -- paseo spawns with
+#                                          shell: false. Each is published only
+#                                          while its underlying binary exists)
+#   - agents.providers.vclaude / .vcodex   (merged into ~/.paseo/config.json,
+#                                          then live-reloaded without restarting
+#                                          the daemon when its CLI can)
+# vcodex uses `-c` overrides rather than a Codex profile file: Codex's
+# app-server subcommand (what Paseo spawns) applies root-level -c overrides
+# but ignores --profile.
+# A valid manifest with no .vercel_ai_gateway object removes the wrappers and
+# Paseo providers; a missing or malformed manifest leaves existing state
+# untouched. Never touches ~/.claude/settings.json or ~/.codex/config.toml.
+set -euo pipefail
+
+STATE_DIR="${DEVBOX_RUNTIME_STATE_DIR:-/var/lib/devbox-runtime}"
+DEV_HOME="${DEVBOX_DEV_HOME:-/home/dev}"
+MANIFEST="$STATE_DIR/manifest.json"
+CLAUDE_BIN="${DEVBOX_CLAUDE_BIN:-$DEV_HOME/.local/bin/claude}"
+CODEX_BIN="${DEVBOX_CODEX_BIN:-$DEV_HOME/.local/bin/codex}"
+VCLAUDE_BIN="${DEVBOX_VCLAUDE_BIN:-/usr/local/bin/vclaude}"
+VCODEX_BIN="${DEVBOX_VCODEX_BIN:-/usr/local/bin/vcodex}"
+KEY_DIR="${DEVBOX_VERCEL_KEY_DIR:-$DEV_HOME/.config/vercel-ai-gateway}"
+KEY_FILE="$KEY_DIR/api-key"
+PASEO_BIN="${DEVBOX_PASEO_BIN:-$DEV_HOME/.local/bin/paseo}"
+PASEO_CONFIG_FILE="${DEVBOX_PASEO_CONFIG_FILE:-$DEV_HOME/.paseo/config.json}"
+
+CLAUDE_CODE_ENDPOINT="https://ai-gateway.vercel.sh/claude-code"
+CODEX_ENDPOINT="https://ai-gateway.vercel.sh/codex/v1"
+
+if [ "${DEVBOX_SKIP_ROOT_CHECK:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  echo "FATAL: run as root" >&2
+  exit 1
+fi
+
+dev_owner="$(stat -c %U "$DEV_HOME" 2>/dev/null || echo dev)"
+
+install_as_dev() { # path mode content-file
+  install -m "$2" "$3" "$1" 2>/dev/null || { cp "$3" "$1"; chmod "$2" "$1"; }
+  chown "$dev_owner:$dev_owner" "$1" 2>/dev/null || true
+}
+
+run_as_dev() {
+  if [ "${DEVBOX_SKIP_ROOT_CHECK:-0}" = 1 ]; then
+    HOME="$DEV_HOME" "$@"
+  else
+    sudo -u "$dev_owner" -H env HOME="$DEV_HOME" "$@"
+  fi
+}
+
+reload_paseo_config() {
+  if [ ! -x "$PASEO_BIN" ]; then
+    return 0
+  fi
+  local paseo_help
+  if ! paseo_help="$(run_as_dev "$PASEO_BIN" --help)"; then
+    echo "devbox-vercel-gateway: failed to inspect Paseo CLI capabilities" >&2
+    return 1
+  fi
+  if grep -qE '^[[:space:]]+reload([[:space:]]|$)' <<< "$paseo_help"; then
+    if ! run_as_dev "$PASEO_BIN" reload --json >/dev/null; then
+      echo "devbox-vercel-gateway: failed to reload Paseo daemon config" >&2
+      return 1
+    fi
+  else
+    echo "WARN: installed Paseo has no reload command; restart Paseo to load provider changes" >&2
+  fi
+}
+
+paseo_config_usable() {
+  [ -f "$PASEO_CONFIG_FILE" ] \
+    && jq -e 'type == "object"' "$PASEO_CONFIG_FILE" >/dev/null 2>&1
+}
+
+# Make agents.providers.{vclaude,vcodex} equal EXACTLY $1 (an object keyed by
+# provider id; ids absent from it are deleted). Validated before it lands --
+# Paseo's PersistedConfigSchema is strict, and a stray key aborts the dev's
+# daemon at startup. Same-directory mktemp + mv: an atomic rename a running
+# daemon cannot observe half-written. Sets paseo_changed=1 when the file moved.
+paseo_changed=0
+write_paseo_providers() { # desired-json
+  local desired="$1" tmp
+  tmp="$(mktemp "$(dirname "$PASEO_CONFIG_FILE")/.config.json.XXXXXX")"
+  if ! jq --argjson desired "$desired" '
+        del(.agents.providers.vclaude, .agents.providers.vcodex)
+        | if ($desired | length) > 0 then .agents.providers += $desired else . end
+      ' "$PASEO_CONFIG_FILE" > "$tmp" 2>/dev/null \
+      || ! jq -e --argjson desired "$desired" '
+        (.agents.providers // {}) as $p
+        | all($desired | keys[]; . as $id | $p[$id] as $e
+            | ($e | keys
+                - ["extends","label","description","command","env","params",
+                   "models","additionalModels","disallowedTools","enabled","order"]
+                | length == 0)
+              and $e.extends == $desired[$id].extends
+              and ($e.label | type == "string")
+              and ($e.command | length == 1))
+      ' "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    echo "devbox-vercel-gateway: paseo provider render failed validation; config left unchanged" >&2
+    return 1
+  fi
+  if cmp -s "$tmp" "$PASEO_CONFIG_FILE"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  chown "$dev_owner:$dev_owner" "$tmp" 2>/dev/null || true
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$PASEO_CONFIG_FILE"
+  paseo_changed=1
+}
+
+publish_file() { # dest content-file  (root-owned 0755, only rewritten on change)
+  install -d -m 0755 "$(dirname "$1")"
+  if [ ! -f "$1" ] || ! cmp -s "$2" "$1"; then
+    install -m 0755 "$2" "$1"
+  fi
+}
+
+# Shared head of both wrappers: AI_GATEWAY_API_KEY in the environment wins;
+# otherwise the pasted file, whitespace-trimmed. No key → a hint, never a
+# request with an empty token.
+wrapper_head() { # tool-label plain-command
+  cat <<EOF
+#!/usr/bin/env bash
+# Managed by devbox-vercel-gateway. Edits are overwritten.
+# $1 through Vercel AI Gateway with your own gateway key. Plain $2 is untouched.
+set -euo pipefail
+key_file=$(printf %q "$KEY_FILE")
+key="\${AI_GATEWAY_API_KEY:-}"
+if [ -z "\$key" ] && [ -r "\$key_file" ]; then
+  key="\$(tr -d '[:space:]' < "\$key_file")"
+fi
+if [ -z "\$key" ]; then
+  echo "\$(basename "\$0"): no Vercel AI Gateway key yet. Paste yours (vck_...) into \$key_file:" >&2
+  echo "  echo 'vck_...' > \$key_file" >&2
+  exit 1
+fi
+EOF
+}
+
+render_vclaude() { # dest
+  local tmp
+  tmp="$(mktemp)"
+  {
+    wrapper_head "Claude Code" "claude"
+    cat <<EOF
+export ANTHROPIC_BASE_URL="$CLAUDE_CODE_ENDPOINT"
+export ANTHROPIC_AUTH_TOKEN="\$key"
+export ANTHROPIC_API_KEY=""   # must be empty, or it takes precedence over the token
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1   # gateway catalog in /model
+exec $(printf %q "$CLAUDE_BIN") "\$@"
+EOF
+  } > "$tmp"
+  publish_file "$1" "$tmp"
+  rm -f "$tmp"
+}
+
+render_vcodex() { # dest codex-model
+  local tmp
+  tmp="$(mktemp)"
+  {
+    wrapper_head "Codex" "codex"
+    cat <<EOF
+export AI_GATEWAY_API_KEY="\$key"
+# Root-level -c overrides reach every subcommand, including app-server (Paseo).
+# Override the model per run with -m.
+exec $(printf %q "$CODEX_BIN") \\
+  -c model_provider=vercel \\
+  -c 'model_providers.vercel.name="Vercel AI Gateway"' \\
+  -c 'model_providers.vercel.base_url="$CODEX_ENDPOINT"' \\
+  -c 'model_providers.vercel.env_key="AI_GATEWAY_API_KEY"' \\
+  -c 'model_providers.vercel.wire_api="responses"' \\
+  -c 'model="$2"' \\
+  "\$@"
+EOF
+  } > "$tmp"
+  publish_file "$1" "$tmp"
+  rm -f "$tmp"
+}
+
+cleanup_vercel_gateway() {
+  rm -f "$VCLAUDE_BIN" "$VCODEX_BIN"
+  if paseo_config_usable \
+      && jq -e '.agents.providers | type == "object" and (has("vclaude") or has("vcodex"))' \
+        "$PASEO_CONFIG_FILE" >/dev/null 2>&1; then
+    write_paseo_providers '{}' || return 1
+    if [ "$paseo_changed" = 1 ]; then
+      reload_paseo_config || return 1
+    fi
+  fi
+  echo "devbox-vercel-gateway: disabled; managed wrappers and Paseo providers removed (key file left in place)"
+}
+
+if [ ! -f "$MANIFEST" ]; then
+  echo "devbox-vercel-gateway: manifest absent; leaving existing state unchanged"
+  exit 0
+fi
+if ! jq -e 'type == "object" and .schema == 1' "$MANIFEST" >/dev/null 2>&1; then
+  echo "FATAL: runtime manifest is malformed; leaving existing state unchanged" >&2
+  exit 1
+fi
+if ! jq -e 'has("vercel_ai_gateway")' "$MANIFEST" >/dev/null; then
+  cleanup_vercel_gateway
+  exit $?
+fi
+if ! jq -e '.vercel_ai_gateway | type == "object" and (.codex_model | type == "string" and length > 0)' \
+    "$MANIFEST" >/dev/null 2>&1; then
+  echo "FATAL: manifest vercel_ai_gateway object is malformed; leaving existing state unchanged" >&2
+  exit 1
+fi
+codex_model="$(jq -re .vercel_ai_gateway.codex_model "$MANIFEST")"
+# provider/model, and nothing that could escape the single-quoted -c value.
+if ! [[ "$codex_model" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]; then
+  echo "FATAL: vercel_ai_gateway.codex_model must be provider/model (e.g. openai/gpt-6-astra); leaving existing state unchanged" >&2
+  exit 1
+fi
+
+# ----- 1. ~/.config/vercel-ai-gateway/api-key: empty until the dev pastes -----
+install -d -m 0700 "$KEY_DIR"
+chmod 0700 "$KEY_DIR"
+chown "$dev_owner:$dev_owner" "$KEY_DIR" 2>/dev/null || true
+if [ ! -f "$KEY_FILE" ]; then
+  tmp_key="$(mktemp)"
+  : > "$tmp_key"
+  install_as_dev "$KEY_FILE" 0600 "$tmp_key"
+  rm -f "$tmp_key"
+  echo "devbox-vercel-gateway: created empty $KEY_FILE (0600) for the dev to paste their key into"
+fi
+chmod 0600 "$KEY_FILE"
+chown "$dev_owner:$dev_owner" "$KEY_FILE" 2>/dev/null || true
+
+# ----- 2. Wrappers, each gated on its binary -----
+if [ -x "$CLAUDE_BIN" ]; then
+  render_vclaude "$VCLAUDE_BIN"
+else
+  rm -f "$VCLAUDE_BIN"
+  echo "WARN: $CLAUDE_BIN missing; vclaude withheld until Claude Code is installed" >&2
+fi
+if [ -x "$CODEX_BIN" ]; then
+  render_vcodex "$VCODEX_BIN" "$codex_model"
+else
+  rm -f "$VCODEX_BIN"
+  echo "WARN: $CODEX_BIN missing; vcodex withheld until Codex is installed" >&2
+fi
+
+# ----- 3. Paseo providers for whichever wrappers are published -----
+if paseo_config_usable; then
+  desired='{}'
+  if [ -x "$VCLAUDE_BIN" ]; then
+    desired="$(jq -c --argjson d "$desired" --arg bin "$VCLAUDE_BIN" '$d + {vclaude: {
+      extends: "claude", label: "Claude (Vercel Gateway)",
+      description: "Claude Code through Vercel AI Gateway with your own gateway key",
+      command: [$bin]}}' <<< null)"
+  fi
+  if [ -x "$VCODEX_BIN" ]; then
+    desired="$(jq -c --argjson d "$desired" --arg bin "$VCODEX_BIN" '$d + {vcodex: {
+      extends: "codex", label: "Codex (Vercel Gateway)",
+      description: "Codex through Vercel AI Gateway with your own gateway key",
+      command: [$bin]}}' <<< null)"
+  fi
+  write_paseo_providers "$desired" || exit 1
+  # Retry even unchanged renders so a previously failed reload is repaired on
+  # the next converge. Actual reload errors stay fatal.
+  reload_paseo_config || exit 1
+else
+  echo "devbox-vercel-gateway: no usable $PASEO_CONFIG_FILE; Paseo providers not registered"
+fi
+
+echo "devbox-vercel-gateway: converged (codex model $codex_model)"
