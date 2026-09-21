@@ -71,8 +71,11 @@ echo 'vck_...' > ~/.config/vercel-ai-gateway/api-key
 ```
 
 The file already exists, empty, at mode 600. Until it holds a key, `vclaude`
-and `vcodex` exit with a hint. `vcodex` starts on the fleet's default gateway
-model; pick another with `-m provider/model`, or `/model` inside either tool.
+and `vcodex` exit with a hint, and Paseo lists **Codex (Vercel Gateway)** as
+`error` (its diagnostic shows the same hint). After pasting, run
+`paseo provider diagnostic vcodex` once so Paseo re-probes and the status
+clears. `vcodex` starts on the fleet's default gateway model; pick another
+with `-m provider/model`, or `/model` inside either tool.
 
 Paseo offers **Claude (Vercel Gateway)** and **Codex (Vercel Gateway)** next
 to the regular providers. Two caveats: claude.ai org connectors do not load in
