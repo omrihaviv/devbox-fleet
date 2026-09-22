@@ -128,7 +128,29 @@ grep -qx 'AI_GATEWAY_API_KEY=vck_from_env' "$work/codex-env" || fail "env key mu
 expected_codex_args=$'-c\nmodel_provider=vercel\n-c\nmodel_providers.vercel.name="Vercel AI Gateway"\n-c\nmodel_providers.vercel.base_url="https://ai-gateway.vercel.sh/codex/v1"\n-c\nmodel_providers.vercel.env_key="AI_GATEWAY_API_KEY"\n-c\nmodel_providers.vercel.wire_api="responses"\n-c\nmodel="openai/custom-model"\nexec\nsay hi'
 [ "$(cat "$work/codex-args")" = "$expected_codex_args" ] || fail "vcodex argument list drifted: $(cat "$work/codex-args")"
 
-# 5. Re-run is idempotent and never rewrites an existing key (content kept, mode enforced).
+# 5. Personal Paseo edits survive a re-converge: keys outside the two managed
+#    entries are untouched, dev tuning INSIDE them (enabled, additionalModels)
+#    is kept, and only the identity keys we own are re-asserted.
+jq '.agents.providers.vcodex.enabled = false
+  | .agents.providers.vcodex.additionalModels = [{"id":"openai/x","label":"X"}]
+  | .agents.providers.vclaude.command = ["/wrong/path"]
+  | .agents.providers.vclaude.label = "Renamed by dev"
+  | .agents.providers["claude-work"] = {"extends":"claude","label":"Work","env":{"ANTHROPIC_API_KEY":"sk-work"}}
+  | .daemon = {"appendSystemPrompt":"be terse"}' "$work/home/.paseo/config.json" > "$work/edited.json"
+mv "$work/edited.json" "$work/home/.paseo/config.json"
+run_concern || fail "re-converge over dev edits must succeed"
+jq -e '.agents.providers.vcodex.enabled == false
+  and .agents.providers.vcodex.additionalModels == [{"id":"openai/x","label":"X"}]
+  and .agents.providers.vcodex.command == ["'"$work"'/usr/local/bin/vcodex"]
+  and .agents.providers.vclaude.command == ["'"$work"'/usr/local/bin/vclaude"]
+  and .agents.providers.vclaude.label == "Claude (Vercel Gateway)"
+  and .agents.providers["claude-work"].env.ANTHROPIC_API_KEY == "sk-work"
+  and .agents.providers.opencode.enabled == true
+  and .daemon.appendSystemPrompt == "be terse"
+  and .features.webUi.enabled == false' "$work/home/.paseo/config.json" >/dev/null \
+  || fail "re-converge must keep dev edits and re-assert only extends/label/description/command: $(cat "$work/home/.paseo/config.json")"
+
+# 5b. Re-run is idempotent and never rewrites an existing key (content kept, mode enforced).
 chmod 644 "$key_file"
 : > "$work/paseo.log"
 before="$(sha256sum "$work/usr/local/bin/vclaude" "$work/usr/local/bin/vcodex" "$work/home/.paseo/config.json")"

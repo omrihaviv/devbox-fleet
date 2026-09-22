@@ -10,9 +10,14 @@
 #     /usr/local/bin/vcodex                 functions -- paseo spawns with
 #                                          shell: false. Each is published only
 #                                          while its underlying binary exists)
-#   - agents.providers.vclaude / .vcodex   (merged into ~/.paseo/config.json,
-#                                          then live-reloaded without restarting
-#                                          the daemon when its CLI can)
+#   - agents.providers.vclaude / .vcodex   (merged into ~/.paseo/config.json:
+#                                          only those two entries are touched,
+#                                          and inside them only extends/label/
+#                                          description/command are re-asserted --
+#                                          a dev's own keys there (enabled,
+#                                          models, env, ...) and everything else
+#                                          in the file survive. Live-reloaded
+#                                          without restarting the daemon)
 # vcodex uses `-c` overrides rather than a Codex profile file: Codex's
 # app-server subcommand (what Paseo spawns) applies root-level -c overrides
 # but ignores --profile.
@@ -80,18 +85,25 @@ paseo_config_usable() {
     && jq -e 'type == "object"' "$PASEO_CONFIG_FILE" >/dev/null 2>&1
 }
 
-# Make agents.providers.{vclaude,vcodex} equal EXACTLY $1 (an object keyed by
-# provider id; ids absent from it are deleted). Validated before it lands --
-# Paseo's PersistedConfigSchema is strict, and a stray key aborts the dev's
-# daemon at startup. Same-directory mktemp + mv: an atomic rename a running
-# daemon cannot observe half-written. Sets paseo_changed=1 when the file moved.
+# Reconcile agents.providers.{vclaude,vcodex} against $1 (an object keyed by
+# provider id). Managed ids absent from $1 are deleted; present ones are merged
+# ON TOP of whatever the dev has there, so the keys we own (extends, label,
+# description, command) are re-asserted while dev-added keys (enabled, models,
+# additionalModels, env, ...) survive. Nothing outside those two entries is
+# read or written. Validated before it lands -- Paseo's PersistedConfigSchema
+# is strict, and a stray key aborts the dev's daemon at startup. Same-directory
+# mktemp + mv: an atomic rename a running daemon cannot observe half-written.
+# Sets paseo_changed=1 when the file moved.
 paseo_changed=0
 write_paseo_providers() { # desired-json
   local desired="$1" tmp
   tmp="$(mktemp "$(dirname "$PASEO_CONFIG_FILE")/.config.json.XXXXXX")"
   if ! jq --argjson desired "$desired" '
-        del(.agents.providers.vclaude, .agents.providers.vcodex)
-        | if ($desired | length) > 0 then .agents.providers += $desired else . end
+        ["vclaude", "vcodex"] as $managed
+        | (.agents.providers // {}) as $cur
+        | .agents.providers = ($cur
+            | with_entries(.key as $k | select((($k | IN($managed[])) | not) or ($desired | has($k))))
+            | reduce ($desired | to_entries[]) as $e (.; .[$e.key] = ((.[$e.key] // {}) + $e.value)))
       ' "$PASEO_CONFIG_FILE" > "$tmp" 2>/dev/null \
       || ! jq -e --argjson desired "$desired" '
         (.agents.providers // {}) as $p

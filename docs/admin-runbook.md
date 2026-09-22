@@ -296,6 +296,22 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
   DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
     scripts/gcp/promote-runtime.sh "$SHA"                               # fleet converges within ~9h
   ```
+  A candidate run is one-shot. The next timer run (00:00, 08:00, 16:00 UTC)
+  pulls the promoted pointer again and reverts the canary — and a concern
+  whose manifest object is absent from the promoted manifest runs its
+  cleanup, so the canary's new state is actively removed, not merely left
+  stale. Promote the same day, or pin the canary until you do (as root on
+  the box):
+  ```bash
+  install -d /etc/systemd/system/devbox-converge.service.d
+  printf '[Service]\nEnvironment=DEVBOX_MANIFEST_SHA=%s\n' "$SHA" \
+    > /etc/systemd/system/devbox-converge.service.d/50-canary.conf
+  systemctl daemon-reload
+  # after promote-runtime.sh: rm -f that drop-in and daemon-reload again
+  ```
+  Converge also self-updates before dispatching and keeps running the code it
+  started with, so a change that adds a concern becomes active on the second
+  converge run — run it twice when canarying.
 - **Disable the fleet's Bedrock setup.** Set `bedrock_role_arn = ""` in
   `gcp/terraform.tfvars`, then use the runtime canary → promote flow above.
   Convergence removes the managed Codex Bedrock defaults, legacy Codex profile

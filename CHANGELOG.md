@@ -19,7 +19,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **Codex (Vercel Gateway)** in Paseo (live-reloaded), and pre-creates an empty
   0600 `~/.config/vercel-ai-gateway/api-key` for each dev's own key. Plain
   `claude`/`codex` and personal settings are untouched; `null` removes the
-  managed wrappers and providers.
+  managed wrappers and providers. Dev edits inside the two Paseo entries
+  (`enabled`, `models`, `env`, ...) survive re-converges. The admin runbook now
+  documents that an unpinned canary is reverted by the next timer run.
 - Claude Fable 5.1 (`global.anthropic.claude-fable-5-1[1m]`) as the fleet
   Bedrock default, with Fable 5 retained in bclaude's `/model` picker. The
   runtime now requires Claude Code 2.1.255 or newer and uses the authorized
