@@ -10,6 +10,14 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 [ -x "$PROMOTE" ] || fail "scripts/gcp/promote-runtime.sh missing or not executable"
 [ -x "$SYNC" ] || fail "scripts/gcp/sync-converge.sh missing or not executable"
 
+# The runbook must keep warning that an unpinned canary is reverted by the next
+# timer run, and show the pin (learned the hard way on 2026-09-21).
+RUNBOOK="$repo_root/docs/admin-runbook.md"
+rg -q --fixed-strings 'A candidate run is one-shot' "$RUNBOOK" \
+  || fail "admin runbook must warn that an unpinned canary reverts on the next timer run"
+rg -q --fixed-strings 'Environment=DEVBOX_MANIFEST_SHA=%s' "$RUNBOOK" \
+  || fail "admin runbook must document pinning a canary via DEVBOX_MANIFEST_SHA"
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin"

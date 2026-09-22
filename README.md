@@ -47,6 +47,10 @@ flowchart LR
   their vendor repos and are **not promotion-gated**.
 - **Optional Amazon Bedrock** — boxes federate their GCP identity into one
   AWS role; no AWS keys on any box.
+- **Optional Vercel AI Gateway** — `vclaude` / `vcodex` wrappers and matching
+  Paseo providers route Claude Code and Codex through Vercel AI Gateway with a
+  per-developer key the dev pastes on the box; plain `claude`/`codex` stay on
+  personal logins.
 
 ## What's on every box
 

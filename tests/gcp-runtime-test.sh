@@ -46,12 +46,13 @@ if rg -q '"runtime/manifest\.json"' "$RUNTIME"; then
   fail "gcp/runtime.tf must not manage runtime/manifest.json — promotion only (scripts/gcp/promote-runtime.sh)"
 fi
 
-# The 5 bundle scripts, GCP variants + shared.
-for s in devbox-converge devbox-memory-hotfix devbox-toolchain devbox-observability devbox-bedrock-config; do
+# The 6 bundle scripts, GCP variants + shared.
+for s in devbox-converge devbox-memory-hotfix devbox-toolchain devbox-observability devbox-bedrock-config devbox-vercel-gateway; do
   rg -q --fixed-strings "\"$s\"" "$RUNTIME" || fail "bundle must include $s"
 done
 assert_contains 'scripts/gcp/devbox-converge'
 assert_contains 'scripts/devbox-memory-hotfix'
+assert_contains 'scripts/gcp/devbox-vercel-gateway'
 
 # devbox-aws-creds ships in the bundle too (installed, not dispatched).
 assert_contains 'devbox-aws-creds'
@@ -62,6 +63,10 @@ assert_contains 'roles/storage.objectViewer'
 
 # Bedrock keys must be optional (absent → concern removes managed setup).
 assert_contains 'var.bedrock_role_arn == ""'
+
+# Vercel AI Gateway object must be optional (null → concern removes wrappers).
+assert_contains 'var.vercel_ai_gateway == null'
+assert_contains 'codex_model = var.vercel_ai_gateway.codex_model'
 
 # VS Code is installed only by the new-machine toolchain gate, but its
 # latest-at-create policy is delivered through the GCP runtime manifest.

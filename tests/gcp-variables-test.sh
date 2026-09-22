@@ -131,4 +131,8 @@ assert_contains 'DEVBOX_PASEO_CLI_TARBALL_SHA256    = var.toolchain.paseo_cli_ta
 assert_not_contains 'claude_installer_sha256' "$VARIABLES"
 assert_not_contains 'codex_installer_sha256' "$VARIABLES"
 
+# Vercel AI Gateway wrappers are opt-in and carry no secret.
+assert_contains 'variable "vercel_ai_gateway"' "$VARIABLES"
+assert_contains '# vercel_ai_gateway = { codex_model = "openai/gpt-6-astra" }' "$EXAMPLE"
+
 echo "PASS: gcp-variables-test"

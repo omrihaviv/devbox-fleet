@@ -157,6 +157,7 @@ if [ "${DEVBOX_SKIP_CONCERNS:-0}" != 1 ]; then
   run_concern "toolchain" "devbox-toolchain"
   run_concern "observability" "devbox-observability"
   run_concern "bedrock-config" "devbox-bedrock-config"
+  run_concern "vercel-gateway" "devbox-vercel-gateway"
 fi
 
 rm -f "$manifest_tmp"

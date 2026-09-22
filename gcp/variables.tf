@@ -463,3 +463,18 @@ variable "codex_mcp_connectors" {
     error_message = "Every key in codex_mcp_connectors must be alphanumeric with optional underscores/hyphens: the key becomes the Codex MCP server name and its TOML table name, and anything else (a dot especially) would register the server under the wrong name."
   }
 }
+
+# ----- Vercel AI Gateway (optional: null → manifest omits the object →
+# devbox-vercel-gateway removes vclaude/vcodex and their Paseo providers) -----
+
+variable "vercel_ai_gateway" {
+  description = "Opt-in Vercel AI Gateway wrappers. When set, convergence publishes /usr/local/bin/vclaude and /usr/local/bin/vcodex (Claude Code and Codex routed through ai-gateway.vercel.sh) and registers both as Paseo providers; plain claude/codex stay on each dev's personal login. Every dev pastes their OWN gateway key into ~/.config/vercel-ai-gateway/api-key, which convergence pre-creates empty at mode 0600 — the key is per developer and never travels through this variable, the manifest, or instance metadata. codex_model is the gateway model id vcodex starts on (provider/model form; devs override per run with -m). null disables and removes the managed wrappers and providers; the key file is left in place."
+  type = object({
+    codex_model = optional(string, "openai/gpt-6-astra")
+  })
+  default = null
+  validation {
+    condition     = var.vercel_ai_gateway == null || can(regex("^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:-]*$", var.vercel_ai_gateway.codex_model))
+    error_message = "vercel_ai_gateway.codex_model must be a gateway model id in provider/model form, e.g. openai/gpt-6-astra."
+  }
+}

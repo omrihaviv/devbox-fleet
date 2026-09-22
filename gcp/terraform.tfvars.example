@@ -81,6 +81,10 @@ devbox_alert_email  = "ops@example.com"
 # ---- Optional: Bedrock access via aws-federation/ (fill after its apply) ----
 # bedrock_role_arn = "arn:aws:iam::123456789012:role/devbox-gcp-workload"
 
+# ---- Optional: Vercel AI Gateway wrappers (vclaude / vcodex + Paseo providers) ----
+# Devs paste their own gateway key on the box; nothing secret goes here.
+# vercel_ai_gateway = { codex_model = "openai/gpt-6-astra" }
+
 # ---- Optional: MCP servers registered for every dev's Codex at onboarding ----
 # http_headers is NOT a secret store — never put a token or API key here.
 # codex_mcp_connectors = {

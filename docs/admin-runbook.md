@@ -296,6 +296,22 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
   DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
     scripts/gcp/promote-runtime.sh "$SHA"                               # fleet converges within ~9h
   ```
+  A candidate run is one-shot. The next timer run (00:00, 08:00, 16:00 UTC)
+  pulls the promoted pointer again and reverts the canary — and a concern
+  whose manifest object is absent from the promoted manifest runs its
+  cleanup, so the canary's new state is actively removed, not merely left
+  stale. Promote the same day, or pin the canary until you do (as root on
+  the box):
+  ```bash
+  install -d /etc/systemd/system/devbox-converge.service.d
+  printf '[Service]\nEnvironment=DEVBOX_MANIFEST_SHA=%s\n' "$SHA" \
+    > /etc/systemd/system/devbox-converge.service.d/50-canary.conf
+  systemctl daemon-reload
+  # after promote-runtime.sh: rm -f that drop-in and daemon-reload again
+  ```
+  Converge also self-updates before dispatching and keeps running the code it
+  started with, so a change that adds a concern becomes active on the second
+  converge run — run it twice when canarying.
 - **Disable the fleet's Bedrock setup.** Set `bedrock_role_arn = ""` in
   `gcp/terraform.tfvars`, then use the runtime canary → promote flow above.
   Convergence removes the managed Codex Bedrock defaults, legacy Codex profile
@@ -312,6 +328,21 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
   temporary AWS credentials; this setting removes client configuration and
   does not revoke the AWS role's IAM trust. The optional `aws-federation/` root
   remains available; restore its role ARN and roll out again to re-enable.
+- **Enable or disable the Vercel AI Gateway wrappers.** Set
+  `vercel_ai_gateway = {}` (or `{ codex_model = "<provider>/<model>" }`) in
+  `gcp/terraform.tfvars` and roll out through the canary → promote flow above.
+  Convergence publishes `/usr/local/bin/vclaude` and `/usr/local/bin/vcodex`,
+  registers **Claude (Vercel Gateway)** and **Codex (Vercel Gateway)** in
+  Paseo, and pre-creates `~/.config/vercel-ai-gateway/api-key` empty at mode
+  0600. The key is per developer: mint one per dev in the Vercel dashboard (or
+  `vercel ai-gateway api-keys create`, with a budget), hand it over out of band,
+  and the dev pastes it into that file — nothing secret rides the manifest.
+  Plain `claude`/`codex`, `~/.claude/settings.json`, and `~/.codex/config.toml`
+  are untouched. Setting the variable back to `null` removes the wrappers and
+  Paseo providers on the next converge; the key file is left in place. Verify a
+  canary with `ls -l /usr/local/bin/vclaude /usr/local/bin/vcodex`,
+  `stat -c '%a %U' ~/.config/vercel-ai-gateway/api-key` (600 dev), and
+  `paseo provider ls` listing both gateway providers.
 - **Resize `machine_type`.** Change it in tfvars, `terraform -chdir=gcp apply`. `allow_stopping_for_update = true` stops and restarts the instance in place — NOT a rebuild (no generation bump, no key rotation, data disk untouched).
 - **Grow the data disk.** Raise `data_disk_gb` in tfvars (grow-only — GCE rejects shrinks), `terraform -chdir=gcp apply`, then extend the filesystem on the box:
   ```bash
