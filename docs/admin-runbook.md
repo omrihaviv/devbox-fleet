@@ -414,10 +414,13 @@ restart.
 ### Claude Code installation
 
 Claude Code is a dev-owned native install at `/home/dev/.local/bin/claude`,
-installed once by `ensure_claude_code` and self-updating thereafter. It is
+installed once by `ensure_claude_code` and self-updating thereafter —
+convergence also runs `claude update` on every run (see
+[Scheduled CLI updates](#scheduled-cli-updates)). It is
 unpinned: `/var/lib/devbox-runtime/claude-code-installed` records the version
-that was installed and is the only drift trail. To hold a box at a version,
-run `claude install <version>` as `dev` on that box. The install.sh fetch the
+that was installed and is the only drift trail. A box cannot be held at a
+version: `claude install <version>` as `dev` takes effect immediately, but the
+next converge's `claude update` moves it forward again. The install.sh fetch the
 repair path performs rests on vendor-origin trust (see "Bump the Paseo pin"
 above for the policy note) — install.sh's own manifest check shares an origin
 with the binary it fetches, so it is transport protection, not provenance.
@@ -456,6 +459,53 @@ This keeps active agents running. Older CLIs such as the supported 0.4
 bootstrap pin lack `reload`; convergence warns that their provider changes
 take effect on the next daemon restart. Use `sudo systemctl restart paseo`
 for those versions when an immediate update is needed.
+
+### Scheduled CLI updates
+
+Every converge (00:00, 08:00, 16:00 UTC, plus jitter) runs the vendors' own
+updaters as `dev` — never as root: `claude update` on boxes whose Claude
+Code passes the install contract, and `codex update` with
+`CODEX_NON_INTERACTIVE=1` on boxes whose `codex-cli-installed` marker exists.
+Both run under `timeout -k 30 300`. The CLIs still self-update when a dev
+launches them; the scheduled step only closes the gap on idle boxes.
+
+Updates are **non-fatal**. A failure logs a `WARN: … update failed …; the next
+converge retries` line to the converge unit's journal
+(`sudo journalctl -u devbox-converge`) and neither fails the
+converge nor trips the *devbox converge stale (>23h without success)* alert —
+so a box stuck on an old CLI shows up in the journal, not in monitoring. The
+one exception: after a Claude update the install contract is re-verified, and
+if it now fails the marker is invalidated and that converge fails
+(`ERROR: claude-code failed`), so the normal repair path reinstalls on the
+next run.
+
+`claude update` installs into `~/.local/share/claude/versions/<ver>` and swaps
+the `~/.local/bin/claude` symlink, so running sessions keep the binary they
+started with, and Claude prunes its own old versions. `codex update` re-runs
+the standalone installer into
+`~/.codex/packages/standalone/releases/<ver>-x86_64-unknown-linux-musl` and
+repoints `current`; Codex never removes anything, so convergence prunes every
+release directory except the one `current` points at (a fleet box had
+accumulated 12 releases / 3.8G, and one hit disk-full). A release that a live
+`codex` process is still running from is kept — Codex spawns its helpers
+(`rg`, `bwrap`, code-mode host) from its own release directory — and logged as
+`WARN: … still in use`; the next converge reclaims it. The
+`claude-code-installed` and `codex-cli-installed` markers are rewritten only
+when the version changes, so their `installed=` timestamp stays the drift
+trail.
+
+Check versions and drift on a box:
+
+```bash
+ssh dev@<name>-devbox '
+  claude --version
+  codex --version
+  cat /var/lib/devbox-runtime/claude-code-installed
+  cat /var/lib/devbox-runtime/codex-cli-installed
+  ls ~/.codex/packages/standalone/releases
+  sudo journalctl -u devbox-converge --since "26 hours ago" | grep -iE "claude-code|codex-cli"
+'
+```
 
 ## Day-2 changes to `devbox-onboard` (no rebuild)
 

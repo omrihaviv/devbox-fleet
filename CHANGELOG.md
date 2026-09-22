@@ -14,6 +14,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Convergence now runs the vendors' own updaters on every 8h run, on boxes
+  where the CLI is already installed: `claude update` and
+  `codex update` (`CODEX_NON_INTERACTIVE=1`), each as `dev` under
+  `timeout -k 30 300`. Both are non-fatal — a failure logs a `WARN` line to the
+  converge journal, leaves the run successful, and the next converge retries.
+  The one exception: a Claude update that no longer satisfies the install
+  contract invalidates the marker and fails that converge so the normal repair
+  path reinstalls. Every Codex release directory except the one `current`
+  points at, or one a live `codex` process still runs from, is pruned, so
+  `~/.codex/packages/standalone/releases` no longer grows unbounded. The
+  version markers are rewritten only when the version changes, so their
+  `installed=` timestamp stays the drift trail.
 - Opt-in Vercel AI Gateway wrappers: setting `vercel_ai_gateway` publishes
   `vclaude`/`vcodex`, registers **Claude (Vercel Gateway)** and
   **Codex (Vercel Gateway)** in Paseo (live-reloaded), and pre-creates an empty

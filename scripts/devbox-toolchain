@@ -24,6 +24,8 @@ CODEX_SUCCESS_FILE="${DEVBOX_CODEX_SUCCESS_FILE:-/var/lib/devbox-runtime/codex-c
 CODEX_INSTALLER_URL="${DEVBOX_CODEX_INSTALLER_URL:-https://chatgpt.com/codex/install.sh}"
 CODEX_INSTALL_DIR="${DEVBOX_CODEX_INSTALL_DIR:-$DEV_HOME/.local/bin}"
 CODEX_BIN="${DEVBOX_CODEX_BIN:-$CODEX_INSTALL_DIR/codex}"
+CODEX_STANDALONE_DIR="${DEVBOX_CODEX_STANDALONE_DIR:-$DEV_HOME/.codex/packages/standalone}"
+PROC_ROOT="${DEVBOX_PROC_ROOT:-/proc}"
 PASEO_REQUIRED_FILE="${DEVBOX_PASEO_REQUIRED_FILE:-/var/lib/devbox-runtime/paseo-required}"
 PASEO_SUCCESS_FILE="${DEVBOX_PASEO_SUCCESS_FILE:-/var/lib/devbox-runtime/paseo-installed}"
 PASEO_NPM_PREFIX="${DEVBOX_PASEO_NPM_PREFIX:-$DEV_HOME/.local/share/paseo/npm}"
@@ -501,10 +503,49 @@ claude_record_success() {
 }
 
 ensure_claude_code() {
-  local installer version
+  local installer version update_status
 
   # The contract is recomputed EVERY converge; the marker only caches it.
   if version="$(claude_contract_version)"; then
+    # Nothing is recorded yet: the update below can change the version, and
+    # the single record after it covers every reachable case (update fails ->
+    # the re-read returns the same version; succeeds -> the new one; contract
+    # fails -> the marker is removed instead). remove_legacy_claude_installs
+    # is likewise deferred until after it, because it is a no-op while the
+    # marker is absent.
+    #
+    # Claude Code self-updates only when a dev launches it, so a box nobody
+    # logs into never moves. Running the vendor's own updater here closes
+    # that gap for idle boxes; it installs alongside the running version and
+    # swaps the symlink, so live sessions are untouched.
+    #
+    # NON-FATAL by deliberate policy: a vendor outage (or the 300s bound
+    # firing, exit 124) must not fail the converge and page the fleet over a
+    # box that still has a working, contract-passing Claude Code. -k 30 is
+    # what makes the bound real: an updater that ignores SIGTERM would
+    # otherwise hold the converge lock forever. The status
+    # is captured rather than tested with `if !` so the warning can name the
+    # exit code; either form is required, because run_tool executes this
+    # function under `set -e`.
+    update_status=0
+    (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+      HOME="$DEV_HOME" \
+      timeout -k 30 300 "$CLAUDE_BIN" update) || update_status=$?
+    if [ "$update_status" -ne 0 ]; then
+      echo "WARN: claude-code: update failed with exit $update_status; the next converge retries" >&2
+    fi
+
+    # Re-read the contract instead of reusing $version: the update may have
+    # swapped the binary, and both the marker (the fleet's drift trail) and
+    # the line below must describe what is on the box NOW.
+    if ! version="$(claude_contract_version)"; then
+      # Same invalidate-before-repair rule as the branch below — the marker
+      # must not outlive the condition it attests. The repair is left to the
+      # next converge, which reinstalls through the path below.
+      rm -f "$CLAUDE_SUCCESS_FILE" || return 1
+      echo "claude-code: update left a binary that fails the contract at $CLAUDE_BIN" >&2
+      return 1
+    fi
     claude_record_success "$version" || return 1
     remove_legacy_claude_installs || return 1
     echo "claude-code: already installed $version"
@@ -562,7 +603,10 @@ ensure_claude_code() {
   # install.sh checks the binary it downloads against a release manifest, but
   # that manifest is served from the same origin — transport protection only.
   # The fetch rests on the vendor-origin trust noted above; the binary then
-  # floats by design (Claude Code self-updates).
+  # floats by design — Claude Code self-updates when a dev launches it, and
+  # the already-installed path above runs `claude update` every converge so
+  # idle boxes float too. A fresh install is already latest, so it is not
+  # updated again here.
   if ! (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
       HOME="$DEV_HOME" \
       bash "$installer" "$CLAUDE_INSTALL_TARGET"); then
@@ -605,14 +649,147 @@ remove_legacy_claude_installs() {
   done
 }
 
+# The marker is the fleet's only Codex drift trail (installs are unpinned),
+# so — like claude_record_success — rewrite it ONLY on a version change,
+# never on every converge. The write goes through $CODEX_REQUIRED_FILE so the
+# required->success transition stays a single atomic mv.
+codex_record_success() {
+  local version="$1" recorded
+
+  # Compare the WHOLE recorded version, not its first field: `codex
+  # --version` prints "codex-cli <x.y.z>", so a first-field comparison would
+  # be constant and the marker would never follow an update. head -1 is
+  # defensive against a multi-line --version.
+  if [ -f "$CODEX_SUCCESS_FILE" ]; then
+    recorded="$(head -1 "$CODEX_SUCCESS_FILE")" || return 1
+    [ "${recorded% installed=*}" != "$version" ] || return 0
+  fi
+
+  install -d -m 0755 "$(dirname "$CODEX_SUCCESS_FILE")" || return 1
+  printf '%s installed=%s\n' "$version" "$(date -u --iso-8601=seconds)" \
+    > "$CODEX_REQUIRED_FILE" || return 1
+  mv -f "$CODEX_REQUIRED_FILE" "$CODEX_SUCCESS_FILE" || return 1
+}
+
+# `codex update` re-runs the standalone installer even when the box is
+# current, and never deletes what it supersedes: a real devbox reached 12
+# releases / 3.8G this way, and this fleet has already lost a box to a full
+# data disk. Deleting is therefore part of updating.
+#
+# Two safety invariants: the removal runs as $DEV_USER, so root never unlinks
+# anything under the dev home; and it only runs once `current` has been shown
+# to resolve to a directory INSIDE releases/ — an unrecognised layout is
+# skipped with a warning, never guessed at, because deleting the wrong
+# directory here costs the dev a working Codex. Absent releases/ means the
+# box was not installed this way at all, so there is nothing to warn about.
+# A release directory is NOT free just because `current` points elsewhere.
+# ~/.local/bin/codex resolves through current/, but a session started before
+# an update keeps executing from the release it was launched in, and that
+# process spawns its helpers (codex-code-mode-host, codex-path/rg,
+# codex-resources/bwrap, voice/*) relative to ITS OWN release directory --
+# not via current. Deleting one out from under a live session ENOENTs its
+# next spawn mid-task, so anything still being executed is left for a later
+# converge. Root can read every /proc/<pid>/exe, so this needs no new
+# dependency; a link we cannot read is simply not evidence of use.
+release_in_use() {
+  local release="$1" link target
+
+  for link in "$PROC_ROOT"/[0-9]*/exe; do
+    target="$(readlink "$link" 2>/dev/null)" || continue
+    case "$target" in
+      "$release"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+prune_codex_releases() {
+  local releases current release
+
+  [ -d "$CODEX_STANDALONE_DIR/releases" ] || return 0
+  releases="$(readlink -f "$CODEX_STANDALONE_DIR/releases")" || return 0
+
+  # Containment: releases/ could itself be a symlink pointing out of the dev
+  # home, and the parent check below would still pass -- which would turn the
+  # loop into an rm -rf of arbitrary top-level directories.
+  case "$releases" in
+    "$DEV_HOME"/*) ;;
+    *)
+      echo "WARN: codex-cli: $releases resolves outside $DEV_HOME; skipping release pruning" >&2
+      return 0
+      ;;
+  esac
+
+  current="$(readlink -f "$CODEX_STANDALONE_DIR/current")" || current=""
+  if [ -z "$current" ] || [ ! -d "$current" ] \
+      || [ "$(dirname "$current")" != "$releases" ]; then
+    echo "WARN: codex-cli: $CODEX_STANDALONE_DIR/current does not resolve into $releases; skipping release pruning" >&2
+    return 0
+  fi
+
+  for release in "$releases"/*; do
+    # Never delete a symlink entry. $release comes from the glob while
+    # $current is canonical, so an alias (current -> releases/alias -> the
+    # real directory) compares unequal here -- removing it would leave
+    # current dangling.
+    [ ! -L "$release" ] || continue
+    [ -d "$release" ] || continue
+    [ "$release" != "$current" ] || continue
+    if release_in_use "$release"; then
+      echo "WARN: codex-cli: $release is still in use by a running process; the next converge retries" >&2
+      continue
+    fi
+    if ! sudo -u "$DEV_USER" -H rm -rf "$release"; then
+      echo "WARN: codex-cli: could not remove superseded release $release" >&2
+    fi
+  done
+}
+
 ensure_codex_cli() {
-  local installer
+  local installer update_status codex_version status_line
 
   if [ -f "$CODEX_SUCCESS_FILE" ]; then
     if ! rm -f "$CODEX_REQUIRED_FILE"; then
       return 1
     fi
-    echo "codex-cli: skipped (already installed for this root)"
+
+    # Codex self-updates only when a dev launches it, so a box nobody logs
+    # into keeps its install-time version. NON-FATAL by deliberate policy:
+    # a vendor outage (or the 300s bound firing, exit 124) must not fail the
+    # converge and page the fleet over a box whose Codex still works. The
+    # status is captured rather than tested with `if !` so the warning can
+    # name the exit code; either form is required, because run_tool executes
+    # this function under `set -e`. -k 30 is what makes the bound real: an
+    # updater that ignores SIGTERM would otherwise hold the converge lock
+    # forever. cd first for the same reason as the installer below: the
+    # updater inherits the caller's CWD.
+    update_status=0
+    (cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+      HOME="$DEV_HOME" \
+      CODEX_NON_INTERACTIVE=1 \
+      timeout -k 30 300 "$CODEX_BIN" update) || update_status=$?
+    if [ "$update_status" -ne 0 ]; then
+      echo "WARN: codex-cli: update failed with exit $update_status; the next converge retries" >&2
+      status_line="codex-cli: already installed (update failed)"
+    else
+      status_line="codex-cli: already installed (version unreadable)"
+      if codex_version="$(cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
+          HOME="$DEV_HOME" \
+          "$CODEX_BIN" --version)"; then
+        codex_record_success "$codex_version" || return 1
+        status_line="codex-cli: already installed $codex_version"
+      else
+        # Still not fatal: the update reported success, so this is a vendor
+        # oddity, not a box in a state the converge can repair. The stale
+        # marker keeps the last known-good version rather than claiming one.
+        echo "WARN: codex-cli: could not read the version after a successful update" >&2
+      fi
+      # Only after a successful update: a failed one replaced nothing, so
+      # there is nothing superseded to collect.
+      prune_codex_releases
+    fi
+
+    echo "$status_line"
     return 0
   fi
 
@@ -660,7 +837,6 @@ ensure_codex_cli() {
   fi
   rm -f "$installer"
 
-  local codex_version
   if ! codex_version="$(cd "$DEV_HOME" && sudo -u "$DEV_USER" -H env \
       HOME="$DEV_HOME" \
       "$CODEX_BIN" --version)"; then

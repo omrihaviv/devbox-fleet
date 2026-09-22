@@ -39,7 +39,10 @@ Want more repos cloned into `~/work/`? Add them to `~/.devbox-repos` (one `owner
 ### Claude Code and Bedrock
 
 **`claude`** is preinstalled and self-updates. It runs on your own personal
-account, so run `/login` as usual.
+account, so run `/login` as usual. The box also runs `claude update` (and
+`codex update`, where Codex is installed) on its 8-hourly converge, so even an
+idle box stays current; old Codex releases are pruned automatically so they
+can't fill your disk.
 
 If your admin enabled **Bedrock federation** for the fleet, your box also has
 **`bclaude`**: it runs Claude Code on **Amazon Bedrock** through a shared

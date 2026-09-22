@@ -233,6 +233,35 @@ case "$*" in
   *"nvm install"*)
     echo "sudo $*" >> "$DEVBOX_TEST_LOG"
     ;;
+  *"timeout -k 30 300 ${CODEX_BIN:-/__unset_codex__} update"*)
+    # Must precede the installer branch below: the update carries the same
+    # CODEX_NON_INTERACTIVE=1 that the installer branch matches on.
+    if [ "$#" -ne 12 ] \
+        || [ "$1" != -u ] \
+        || [ "$2" != "$DEV_USER" ] \
+        || [ "$3" != -H ] \
+        || [ "$4" != env ] \
+        || [ "$5" != "HOME=$DEV_HOME" ] \
+        || [ "$6" != CODEX_NON_INTERACTIVE=1 ] \
+        || [ "$7" != timeout ] \
+        || [ "$8" != -k ] \
+        || [ "$9" != 30 ] \
+        || [ "${10}" != 300 ] \
+        || [ "${11}" != "$CODEX_BIN" ] \
+        || [ "${12}" != update ]; then
+      echo "Codex update did not use the expected dev-user boundary: $*" >&2
+      exit 1
+    fi
+    if [ "$PWD" != "$DEV_HOME" ]; then
+      echo "Codex update did not start from the dev home: cwd=$PWD expected=$DEV_HOME" >&2
+      exit 1
+    fi
+    # Logged here as well as in the stub, so "the updater never ran" is
+    # provable for a box whose codex stub cannot log at all.
+    echo "boundary $*" >> "${DEVBOX_TEST_CODEX_UPDATE_LOG:-/dev/null}"
+    shift 3
+    "$@"
+    ;;
   *"CODEX_NON_INTERACTIVE=1"*)
     installer="${@: -1}"
     # The verified script must stay owned by the converge user (root in
@@ -406,6 +435,32 @@ case "$*" in
     shift 3
     "$@"
     ;;
+  *"timeout -k 30 300 ${CLAUDE_BIN:-/__unset_claude__} update"*)
+    if [ "$#" -ne 11 ] \
+        || [ "$1" != -u ] \
+        || [ "$2" != "$DEV_USER" ] \
+        || [ "$3" != -H ] \
+        || [ "$4" != env ] \
+        || [ "$5" != "HOME=$DEV_HOME" ] \
+        || [ "$6" != timeout ] \
+        || [ "$7" != -k ] \
+        || [ "$8" != 30 ] \
+        || [ "$9" != 300 ] \
+        || [ "${10}" != "$CLAUDE_BIN" ] \
+        || [ "${11}" != update ]; then
+      echo "Claude update did not use the expected dev-user boundary: $*" >&2
+      exit 1
+    fi
+    if [ "$PWD" != "$DEV_HOME" ]; then
+      echo "Claude update did not start from the dev home: cwd=$PWD expected=$DEV_HOME" >&2
+      exit 1
+    fi
+    # Logged here as well as in the stub, so "the updater never ran" is
+    # provable for a box whose claude stub cannot log at all.
+    echo "boundary $*" >> "${DEVBOX_TEST_CLAUDE_UPDATE_LOG:-/dev/null}"
+    shift 3
+    "$@"
+    ;;
   *"${CLAUDE_BIN:-/__unset_claude__} --version"*)
     if [ "$#" -ne 7 ] \
         || [ "$1" != -u ] \
@@ -448,6 +503,22 @@ case "$*" in
     fi
     shift 5
     HOME="$DEV_HOME" "$@"
+    ;;
+  *"-H rm -rf "*)
+    # Root must never unlink anything under the dev home: the pruning of
+    # superseded Codex releases has to come through the dev user.
+    if [ "$#" -ne 6 ] \
+        || [ "$1" != -u ] \
+        || [ "$2" != "$DEV_USER" ] \
+        || [ "$3" != -H ] \
+        || [ "$4" != rm ] \
+        || [ "$5" != -rf ]; then
+      echo "Codex release pruning did not use the expected dev-user boundary: $*" >&2
+      exit 1
+    fi
+    echo "prune $6" >> "${DEVBOX_TEST_CODEX_PRUNE_LOG:-/dev/null}"
+    shift 3
+    "$@"
     ;;
   *)
     echo "unexpected sudo $*" >&2
@@ -598,7 +669,15 @@ EOF
 
 extract_codex_step() {
   local out="$1"
-  sed -n '/^ensure_codex_cli()/,/^}/p' "$repo_root/scripts/devbox-toolchain" > "$out"
+  {
+    sed -n '/^codex_record_success()/,/^}/p' "$repo_root/scripts/devbox-toolchain"
+    sed -n '/^release_in_use()/,/^}/p' "$repo_root/scripts/devbox-toolchain"
+    sed -n '/^prune_codex_releases()/,/^}/p' "$repo_root/scripts/devbox-toolchain"
+    sed -n '/^ensure_codex_cli()/,/^}/p' "$repo_root/scripts/devbox-toolchain"
+  } > "$out"
+  grep -q '^codex_record_success()' "$out" || fail "could not extract codex_record_success"
+  grep -q '^release_in_use()' "$out" || fail "could not extract release_in_use"
+  grep -q '^prune_codex_releases()' "$out" || fail "could not extract prune_codex_releases"
   grep -q '^ensure_codex_cli()' "$out" || fail "could not extract ensure_codex_cli"
   grep -q '^}' "$out" || fail "extracted ensure_codex_cli is truncated"
 }
@@ -667,7 +746,32 @@ fi
 mkdir -p "$CODEX_INSTALL_DIR"
 cat > "$CODEX_INSTALL_DIR/codex" <<'CODEX_EOF'
 #!/bin/sh
-printf 'codex-cli test\n'
+# `update` records who ran it (the boundary the converge must keep) and then
+# switches what --version reports, so a test can tell the pre-update reading
+# apart from the post-update one.
+state="${DEVBOX_TEST_CODEX_STUB_STATE:-/dev/null}"
+case "${1:-}" in
+  update)
+    printf 'update user=%s home=%s cwd=%s non_interactive=%s\n' \
+      "$(id -un)" "${HOME:-unset}" "$PWD" "${CODEX_NON_INTERACTIVE:-unset}" \
+      >> "${DEVBOX_TEST_CODEX_UPDATE_LOG:-/dev/null}"
+    if [ "${DEVBOX_TEST_CODEX_UPDATE_FAIL:-0}" = 1 ]; then
+      echo "codex: update failed" >&2
+      exit 1
+    fi
+    if [ -n "${DEVBOX_TEST_CODEX_UPDATED_VERSION:-}" ]; then
+      printf '%s\n' "$DEVBOX_TEST_CODEX_UPDATED_VERSION" > "$state"
+    fi
+    printf 'Update ran successfully! Please restart Codex.\n'
+    ;;
+  *)
+    if [ -s "$state" ]; then
+      cat "$state"
+    else
+      printf 'codex-cli test\n'
+    fi
+    ;;
+esac
 CODEX_EOF
 chmod 0755 "$CODEX_INSTALL_DIR/codex"
 EOF
@@ -690,6 +794,13 @@ run_codex_step() {
     DEVBOX_TEST_CODEX_STATE_MOVE_FAIL="${DEVBOX_TEST_CODEX_STATE_MOVE_FAIL:-0}" \
     DEVBOX_TEST_CODEX_VERIFY_LOG="$workdir/verify.log" \
     DEVBOX_TEST_CODEX_VERIFY_FAIL="${DEVBOX_TEST_CODEX_VERIFY_FAIL:-0}" \
+    DEVBOX_TEST_CODEX_UPDATE_LOG="$workdir/update.log" \
+    DEVBOX_TEST_CODEX_UPDATE_FAIL="${DEVBOX_TEST_CODEX_UPDATE_FAIL:-0}" \
+    DEVBOX_TEST_CODEX_UPDATED_VERSION="${DEVBOX_TEST_CODEX_UPDATED_VERSION:-}" \
+    DEVBOX_TEST_CODEX_STUB_STATE="$workdir/codex-stub-version" \
+    DEVBOX_TEST_CODEX_PRUNE_LOG="$workdir/prune.log" \
+    CODEX_STANDALONE_DIR="$workdir/home/.codex/packages/standalone" \
+    PROC_ROOT="$workdir/proc" \
     DEV_USER="$test_user" \
     DEV_HOME="$workdir/home" \
     GCP_RUNTIME_BUCKET_FILE="$workdir/etc/devbox/runtime-bucket" \
@@ -1389,8 +1500,11 @@ test_codex_success_tombstone_prevents_rearm() {
   run_codex_step "$workdir"
   [ "$(wc -l < "$workdir/install.log")" -eq 1 ] \
     || fail "Codex installer reran while the same bootstrap was still incomplete"
-  [ "$(wc -l < "$workdir/verify.log")" -eq 1 ] \
-    || fail "Codex verification reran while the same bootstrap was still incomplete"
+  # Two readings, not one: the install verified the binary, and the second
+  # converge re-read --version after running the vendor updater. What must
+  # NOT repeat is the install itself, asserted above.
+  [ "$(wc -l < "$workdir/verify.log")" -eq 2 ] \
+    || fail "the already-installed converge did not re-read the Codex version after updating"
   [ ! -e "$workdir/var/lib/devbox-runtime/codex-cli-required" ] \
     || fail "successful Codex install re-armed the retry marker"
 }
@@ -1523,6 +1637,247 @@ test_codex_replacement_root_is_eligible_again() {
     || fail "replacement root retained retry marker after success"
   [ -e "$workdir/var/lib/devbox-runtime/codex-cli-installed" ] \
     || fail "replacement root did not create success marker"
+}
+
+# Shared fixture for the update tests: a box that already carries Codex and
+# the success marker that proves it, with the install-time logs cleared so a
+# later assertion can only be satisfied by the converge under test.
+seed_installed_codex() {
+  local workdir="$1"
+
+  make_fake_bin "$workdir/fake-bin"
+  make_fake_codex_installer "$workdir/install.sh"
+  mkdir -p "$workdir/home" "$workdir/etc/devbox"
+  : > "$workdir/etc/devbox/runtime-bucket"
+  run_codex_step "$workdir" >/dev/null
+  [ -x "$workdir/home/.local/bin/codex" ] || fail "fixture did not install Codex"
+  rm -f "$workdir/update.log" "$workdir/prune.log"
+}
+
+# Codex only self-updates when a dev launches it, so an idle box would keep
+# its install-time version forever. The marker has to follow the box, since
+# it is the fleet's only drift trail.
+test_codex_update_runs_as_dev_and_records_the_new_version() {
+  local workdir marker
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_installed_codex "$workdir"
+  marker="$workdir/var/lib/devbox-runtime/codex-cli-installed"
+
+  DEVBOX_TEST_CODEX_UPDATED_VERSION='codex-cli 9.9.9' \
+    run_codex_step "$workdir" >/dev/null || fail "already-installed converge failed"
+
+  [ -f "$workdir/update.log" ] || fail "already-installed converge did not run codex update"
+  grep -qF "update user=$test_user" "$workdir/update.log" \
+    || fail "codex update did not run as the dev user"
+  grep -qF "home=$workdir/home" "$workdir/update.log" \
+    || fail "codex update did not run with the dev HOME"
+  grep -qF "cwd=$workdir/home" "$workdir/update.log" \
+    || fail "codex update did not start from the dev home"
+  grep -qF 'non_interactive=1' "$workdir/update.log" \
+    || fail "codex update did not run non-interactively"
+  grep -qF 'codex-cli 9.9.9' "$marker" \
+    || fail "marker does not record the post-update version"
+  [ ! -e "$workdir/var/lib/devbox-runtime/codex-cli-required" ] \
+    || fail "recording the new version left the retry marker behind"
+
+  # A converge that changes nothing must not reset installed=, or the drift
+  # trail is destroyed every eight hours.
+  touch -d '2020-01-01T00:00:00Z' "$marker"
+  DEVBOX_TEST_CODEX_UPDATED_VERSION='codex-cli 9.9.9' \
+    run_codex_step "$workdir" >/dev/null || fail "second already-installed converge failed"
+  [ "$(date -u -d "@$(stat -c %Y "$marker")" +%Y)" = 2020 ] \
+    || fail "marker was rewritten even though the version did not change"
+}
+
+# A vendor outage must not fail the converge, because a failed converge pages
+# the fleet — and the box is still perfectly usable on the version it has.
+test_codex_update_failure_is_not_fatal() {
+  local workdir marker err
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_installed_codex "$workdir"
+  marker="$workdir/var/lib/devbox-runtime/codex-cli-installed"
+
+  if ! err="$(DEVBOX_TEST_CODEX_UPDATE_FAIL=1 run_codex_step "$workdir" 2>&1 >/dev/null)"; then
+    fail "a failed codex update aborted the converge"
+  fi
+  grep -qF 'WARN: codex-cli: update failed' <<<"$err" \
+    || fail "a failed codex update did not warn: $err"
+  [ -f "$marker" ] || fail "a failed codex update dropped the success marker"
+}
+
+# `codex update` re-runs the standalone installer and never deletes what it
+# replaces; a real box reached 12 releases / 3.8G this way and this fleet has
+# already lost a devbox to a full disk.
+test_codex_update_prunes_superseded_releases() {
+  local workdir standalone
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_installed_codex "$workdir"
+  standalone="$workdir/home/.codex/packages/standalone"
+
+  mkdir -p "$standalone/releases/a" "$standalone/releases/b" "$standalone/releases/c"
+  : > "$standalone/install.lock"
+  : > "$standalone/auto-update-version"
+  ln -s "$standalone/releases/b" "$standalone/current"
+
+  run_codex_step "$workdir" >/dev/null || fail "already-installed converge failed"
+
+  [ -d "$standalone/releases/b" ] || fail "pruning deleted the current release"
+  [ ! -e "$standalone/releases/a" ] || fail "superseded release a survived pruning"
+  [ ! -e "$standalone/releases/c" ] || fail "superseded release c survived pruning"
+  [ -L "$standalone/current" ] || fail "pruning removed the current symlink"
+  [ -f "$standalone/install.lock" ] || fail "pruning removed install.lock"
+  [ -f "$standalone/auto-update-version" ] || fail "pruning removed auto-update-version"
+  grep -qF "prune $standalone/releases/a" "$workdir/prune.log" \
+    || fail "release pruning did not go through the dev user"
+}
+
+# An unrecognised layout is skipped, never guessed at: deleting the wrong
+# directory here costs the dev their working Codex.
+test_codex_prune_skips_an_unrecognised_layout() {
+  local workdir standalone err
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_installed_codex "$workdir"
+  standalone="$workdir/home/.codex/packages/standalone"
+
+  mkdir -p "$standalone/releases/a" "$standalone/releases/b" "$standalone/releases/c"
+
+  err="$(run_codex_step "$workdir" 2>&1 >/dev/null)" \
+    || fail "a missing current symlink failed the converge"
+  grep -qF 'WARN: codex-cli:' <<<"$err" \
+    || fail "an unresolvable current did not warn: $err"
+  [ -d "$standalone/releases/a" ] && [ -d "$standalone/releases/b" ] \
+    && [ -d "$standalone/releases/c" ] \
+    || fail "a missing current symlink still deleted releases"
+  [ ! -e "$workdir/prune.log" ] || fail "a missing current symlink still ran rm"
+
+  mkdir -p "$workdir/home/elsewhere"
+  ln -s "$workdir/home/elsewhere" "$standalone/current"
+  err="$(run_codex_step "$workdir" 2>&1 >/dev/null)" \
+    || fail "a current pointing outside releases failed the converge"
+  grep -qF 'WARN: codex-cli:' <<<"$err" \
+    || fail "a current outside releases did not warn: $err"
+  [ -d "$standalone/releases/a" ] && [ -d "$standalone/releases/b" ] \
+    && [ -d "$standalone/releases/c" ] \
+    || fail "a current outside releases still deleted releases"
+  [ ! -e "$workdir/prune.log" ] || fail "a current outside releases still ran rm"
+}
+
+# The hard case: ~/.local/bin/codex resolves through current/, but a session
+# started before an update keeps EXECUTING from the release it was launched
+# in and spawns its helpers (rg, bwrap, codex-code-mode-host) relative to
+# that directory. Pruning it would ENOENT the dev's next tool call mid-task.
+test_codex_prune_spares_a_release_a_live_process_runs_from() {
+  local workdir standalone releases err
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_installed_codex "$workdir"
+  standalone="$workdir/home/.codex/packages/standalone"
+
+  mkdir -p "$standalone/releases/a/bin" "$standalone/releases/b" "$standalone/releases/c"
+  ln -s "$standalone/releases/b" "$standalone/current"
+  releases="$(readlink -f "$standalone/releases")"
+
+  # A live process executing out of release a, as /proc reports it.
+  mkdir -p "$workdir/proc/4242"
+  ln -s "$releases/a/bin/codex" "$workdir/proc/4242/exe"
+
+  err="$(run_codex_step "$workdir" 2>&1 >/dev/null)" || fail "already-installed converge failed"
+
+  [ -d "$standalone/releases/a" ] \
+    || fail "pruning deleted a release a live process is running from"
+  [ -d "$standalone/releases/b" ] || fail "pruning deleted the current release"
+  [ ! -e "$standalone/releases/c" ] || fail "an idle superseded release survived pruning"
+  grep -qF "$releases/a is still in use" <<<"$err" \
+    || fail "the skipped in-use release was not named: $err"
+}
+
+# current may point at an alias rather than at a canonical release directory.
+# The alias compares unequal to the canonical target, so a delete here would
+# leave current dangling and the box with no Codex.
+test_codex_prune_never_deletes_a_symlink_entry() {
+  local workdir standalone
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_installed_codex "$workdir"
+  standalone="$workdir/home/.codex/packages/standalone"
+
+  mkdir -p "$standalone/releases/real" "$standalone/releases/c"
+  ln -s "$standalone/releases/real" "$standalone/releases/alias"
+  ln -s "$standalone/releases/alias" "$standalone/current"
+
+  run_codex_step "$workdir" >/dev/null || fail "already-installed converge failed"
+
+  [ -L "$standalone/releases/alias" ] || fail "pruning deleted an alias entry"
+  [ -d "$standalone/releases/real" ] \
+    || fail "pruning deleted the release the alias resolves to"
+  [ ! -e "$standalone/releases/c" ] || fail "superseded release c survived pruning"
+}
+
+# releases/ may itself be a symlink out of the dev home; the parent check
+# alone would still pass and turn the loop into an rm -rf of arbitrary
+# top-level directories.
+test_codex_prune_refuses_releases_outside_the_dev_home() {
+  local workdir standalone outside err
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_installed_codex "$workdir"
+  standalone="$workdir/home/.codex/packages/standalone"
+  outside="$workdir/outside-releases"
+
+  mkdir -p "$outside/a" "$outside/b" "$outside/c"
+  mkdir -p "$standalone"
+  ln -s "$outside" "$standalone/releases"
+  ln -s "$outside/b" "$standalone/current"
+
+  err="$(run_codex_step "$workdir" 2>&1 >/dev/null)" \
+    || fail "a releases directory outside the dev home failed the converge"
+  grep -qF "resolves outside $workdir/home" <<<"$err" \
+    || fail "pruning outside the dev home was not refused: $err"
+  [ -d "$outside/a" ] && [ -d "$outside/b" ] && [ -d "$outside/c" ] \
+    || fail "pruning deleted directories outside the dev home"
+  [ ! -e "$workdir/prune.log" ] || fail "pruning outside the dev home still ran rm"
+}
+
+# A failed update replaced nothing, so nothing is superseded: pruning on that
+# path could only delete a release that is still the live one.
+test_codex_prune_does_not_run_when_the_update_fails() {
+  local workdir standalone
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_installed_codex "$workdir"
+  standalone="$workdir/home/.codex/packages/standalone"
+
+  mkdir -p "$standalone/releases/a" "$standalone/releases/b"
+  ln -s "$standalone/releases/b" "$standalone/current"
+
+  DEVBOX_TEST_CODEX_UPDATE_FAIL=1 run_codex_step "$workdir" >/dev/null 2>&1 \
+    || fail "a failed codex update aborted the converge"
+  [ -d "$standalone/releases/a" ] && [ -d "$standalone/releases/b" ] \
+    || fail "a failed update still pruned releases"
+  [ ! -e "$workdir/prune.log" ] || fail "a failed update still ran rm"
+}
+
+# The update hangs off the already-installed gate: a box that never opted in
+# must not grow a Codex, and a fresh install is already latest.
+test_codex_update_is_skipped_when_codex_is_not_installed() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  make_fake_bin "$workdir/fake-bin"
+  make_fake_codex_installer "$workdir/install.sh"
+  mkdir -p "$workdir/home" "$workdir/etc/devbox"
+
+  run_codex_step "$workdir" >/dev/null
+  [ ! -e "$workdir/update.log" ] || fail "codex update ran on a box without Codex"
+
+  : > "$workdir/etc/devbox/runtime-bucket"
+  run_codex_step "$workdir" >/dev/null
+  [ -x "$workdir/home/.local/bin/codex" ] || fail "bootstrap did not install Codex"
+  [ ! -e "$workdir/update.log" ] || fail "a fresh install re-ran the vendor updater"
 }
 
 test_vscode_new_gcp_bootstrap_and_post_success_noop() {
@@ -2464,6 +2819,52 @@ make_stub_claude() {
   chmod 0755 "$path"
 }
 
+# Writes a stub claude that implements BOTH halves of the already-installed
+# path: `update` logs the boundary it was called through and then switches
+# what --version reports, so a test can tell the pre-update reading apart
+# from the post-update one. DEVBOX_TEST_CLAUDE_UPDATE_FAIL simulates a vendor
+# outage; DEVBOX_TEST_CLAUDE_BREAK_ON_UPDATE simulates an update that leaves
+# a binary the contract rejects.
+make_updating_stub_claude() {
+  local path="$1"
+  mkdir -p "$(dirname "$path")"
+  cat > "$path" <<'EOF'
+#!/bin/sh
+state="${DEVBOX_TEST_CLAUDE_STUB_STATE:-/dev/null}"
+case "${1:-}" in
+  update)
+    printf 'update user=%s home=%s cwd=%s\n' "$(id -un)" "${HOME:-unset}" "$PWD" \
+      >> "${DEVBOX_TEST_CLAUDE_UPDATE_LOG:-/dev/null}"
+    if [ "${DEVBOX_TEST_CLAUDE_UPDATE_FAIL:-0}" = 1 ]; then
+      echo "claude: update failed" >&2
+      exit 1
+    fi
+    if [ "${DEVBOX_TEST_CLAUDE_BREAK_ON_UPDATE:-0}" = 1 ]; then
+      : > "$state.broken"
+      printf 'Claude Code is up to date\n'
+      exit 0
+    fi
+    if [ -n "${DEVBOX_TEST_CLAUDE_UPDATED_VERSION:-}" ]; then
+      printf '%s\n' "$DEVBOX_TEST_CLAUDE_UPDATED_VERSION" > "$state"
+    fi
+    printf 'Claude Code is up to date\n'
+    ;;
+  --version)
+    [ ! -f "$state.broken" ] || exit 3
+    if [ -s "$state" ]; then
+      cat "$state"
+    else
+      printf '%s\n' "${DEVBOX_TEST_CLAUDE_VERSION:-2.9.9 (Claude Code)}"
+    fi
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+  chmod 0755 "$path"
+}
+
 test_claude_contract_accepts_a_good_binary() {
   local workdir out
   workdir="$(mktemp -d)"
@@ -2641,6 +3042,11 @@ run_claude_step() {
     DEVBOX_TEST_CODEX_DOWNLOAD_FAIL="${DEVBOX_TEST_CLAUDE_DOWNLOAD_FAIL:-0}" \
     DEVBOX_TEST_CLAUDE_INSTALL_FAIL="${DEVBOX_TEST_CLAUDE_INSTALL_FAIL:-0}" \
     DEVBOX_TEST_CLAUDE_TARGET_BIN="$workdir/home/.local/bin/claude" \
+    DEVBOX_TEST_CLAUDE_UPDATE_LOG="$workdir/claude-update.log" \
+    DEVBOX_TEST_CLAUDE_UPDATE_FAIL="${DEVBOX_TEST_CLAUDE_UPDATE_FAIL:-0}" \
+    DEVBOX_TEST_CLAUDE_BREAK_ON_UPDATE="${DEVBOX_TEST_CLAUDE_BREAK_ON_UPDATE:-0}" \
+    DEVBOX_TEST_CLAUDE_UPDATED_VERSION="${DEVBOX_TEST_CLAUDE_UPDATED_VERSION:-}" \
+    DEVBOX_TEST_CLAUDE_STUB_STATE="$workdir/claude-stub-version" \
     DEV_USER="$(id -un)" \
     DEV_HOME="$workdir/home" \
     CLAUDE_BIN="$workdir/home/.local/bin/claude" \
@@ -2686,6 +3092,10 @@ test_claude_installs_when_absent() {
   [ -f "$marker" ] || fail "success marker was not written"
   grep -qF '2.9.9 (Claude Code)' "$marker" \
     || fail "marker does not record the resolved version"
+  # A fresh install is already latest; updating it again would just burn a
+  # vendor round-trip on every rebuilt box.
+  [ ! -e "$workdir/claude-update.log" ] \
+    || fail "a fresh install re-ran the vendor updater"
 }
 
 test_claude_second_run_is_a_noop() {
@@ -2705,6 +3115,90 @@ test_claude_second_run_is_a_noop() {
   [ ! -s "$workdir/download.log" ] || fail "second run re-downloaded the installer"
   [ "$(date -u -d "@$(stat -c %Y "$marker")" +%Y)" = 2020 ] \
     || fail "second run rewrote an already-current marker"
+}
+
+# Claude Code only self-updates when a dev launches it, so an idle box would
+# sit on its install-time version. Both the reported line and the marker must
+# describe the version that is on the box AFTER the update.
+test_claude_update_runs_as_dev_and_records_the_new_version() {
+  local workdir marker out
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  make_fake_bin "$workdir/fake-bin"
+  marker="$workdir/var/lib/devbox-runtime/claude-code-installed"
+  make_updating_stub_claude "$workdir/home/.local/bin/claude"
+  seed_legacy_claude_installs "$workdir"
+
+  out="$(DEVBOX_TEST_CLAUDE_UPDATED_VERSION='2.9.10 (Claude Code)' \
+    run_claude_step "$workdir")" || fail "already-installed converge failed"
+
+  [ -f "$workdir/claude-update.log" ] \
+    || fail "already-installed converge did not run claude update"
+  grep -qF "update user=$test_user" "$workdir/claude-update.log" \
+    || fail "claude update did not run as the dev user"
+  grep -qF "home=$workdir/home" "$workdir/claude-update.log" \
+    || fail "claude update did not run with the dev HOME"
+  grep -qF "cwd=$workdir/home" "$workdir/claude-update.log" \
+    || fail "claude update did not start from the dev home"
+  grep -qF 'claude-code: already installed 2.9.10 (Claude Code)' <<<"$out" \
+    || fail "converge did not report the post-update version: $out"
+  grep -qF '2.9.10 (Claude Code)' "$marker" \
+    || fail "marker does not record the post-update version"
+  [ ! -e "$workdir/install.log" ] || fail "an already-installed box re-ran the installer"
+  # The legacy cleanup is guarded on the marker, which this path now writes
+  # only AFTER the update -- so it has to stay ordered behind it.
+  [ ! -e "$workdir/usr/bin/claude" ] \
+    || fail "the already-installed path left the retired system install behind"
+  [ ! -d "$workdir/npm/@anthropic-ai/claude-code" ] \
+    || fail "the already-installed path left the retired npm install behind"
+
+  # An update that changes nothing must not reset installed=, or the fleet's
+  # drift trail is destroyed every eight hours.
+  touch -d '2020-01-01T00:00:00Z' "$marker"
+  DEVBOX_TEST_CLAUDE_UPDATED_VERSION='2.9.10 (Claude Code)' \
+    run_claude_step "$workdir" >/dev/null || fail "second converge failed"
+  [ "$(date -u -d "@$(stat -c %Y "$marker")" +%Y)" = 2020 ] \
+    || fail "marker was rewritten even though the version did not change"
+}
+
+# A vendor outage must not fail the converge (which would page the fleet):
+# the box still has a working, contract-passing Claude Code.
+test_claude_update_failure_is_not_fatal() {
+  local workdir marker err
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  make_fake_bin "$workdir/fake-bin"
+  marker="$workdir/var/lib/devbox-runtime/claude-code-installed"
+  make_updating_stub_claude "$workdir/home/.local/bin/claude"
+
+  if ! err="$(DEVBOX_TEST_CLAUDE_UPDATE_FAIL=1 run_claude_step "$workdir" 2>&1 >/dev/null)"; then
+    fail "a failed claude update aborted the converge"
+  fi
+  grep -qF 'WARN: claude-code: update failed' <<<"$err" \
+    || fail "a failed claude update did not warn: $err"
+  [ -f "$marker" ] || fail "a failed claude update dropped the success marker"
+  grep -qF '2.9.9 (Claude Code)' "$marker" \
+    || fail "marker no longer records the version still on the box"
+}
+
+# An update that leaves a binary the contract rejects is the one case that
+# must fail loudly: the marker is what cleanup, ensure_agent_plugins and
+# devbox-bedrock-config read, so it may not outlive the condition it attests.
+test_claude_broken_update_fails_and_removes_the_marker() {
+  local workdir marker err
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  make_fake_bin "$workdir/fake-bin"
+  marker="$workdir/var/lib/devbox-runtime/claude-code-installed"
+  make_updating_stub_claude "$workdir/home/.local/bin/claude"
+
+  if err="$(DEVBOX_TEST_CLAUDE_BREAK_ON_UPDATE=1 run_claude_step "$workdir" 2>&1 >/dev/null)"; then
+    fail "a contract-breaking update was reported as success"
+  fi
+  grep -qF 'claude-code:' <<<"$err" \
+    || fail "a contract-breaking update did not explain itself: $err"
+  [ ! -e "$marker" ] \
+    || fail "the success marker outlived a binary that fails the contract"
 }
 
 # Regression test: claude_record_success compares the marker's first line
@@ -2899,6 +3393,21 @@ test_codex_connectors_file() {
   echo "PASS codex connectors file"
 }
 
+# The 8-hourly converge must stay bounded: a vendor CLI that hangs would wedge
+# every later step behind it, and -k is what makes the bound real against an
+# updater that ignores SIGTERM. Asserted statically because the kill path only
+# shows itself on a process that refuses to die. (The dev-user boundary of the
+# updates and of the release pruning is asserted behaviourally, by the fake
+# sudo.)
+test_cli_updates_are_bounded() {
+  local script="$repo_root/scripts/devbox-toolchain"
+
+  grep -qF 'timeout -k 30 300 "$CLAUDE_BIN" update' "$script" \
+    || fail "the Claude update is not bounded by timeout -k 30 300"
+  grep -qF 'timeout -k 30 300 "$CODEX_BIN" update' "$script" \
+    || fail "the Codex update is not bounded by timeout -k 30 300"
+}
+
 # The pins only defend the fetches if a manifest that lacks them cannot
 # converge at all: require_env must fail closed, before any tool runs.
 test_require_env_fails_closed_without_the_pin_env() {
@@ -2948,6 +3457,7 @@ test_needrestart_defers_paseo_before_package_work() {
 }
 
 test_require_env_fails_closed_without_the_pin_env
+test_cli_updates_are_bounded
 test_needrestart_defers_paseo_before_package_work
 test_paseo_new_gcp_bootstrap_installs_pinned_tarball_and_writes_tailnet_config
 test_paseo_tarball_download_failure_retains_retry_marker
@@ -2974,6 +3484,15 @@ test_codex_verification_failure_keeps_marker_and_cleans_installer
 test_codex_atomic_state_move_failure_retains_retry
 test_codex_success_dominates_stale_retry_marker
 test_codex_replacement_root_is_eligible_again
+test_codex_update_runs_as_dev_and_records_the_new_version
+test_codex_update_failure_is_not_fatal
+test_codex_update_prunes_superseded_releases
+test_codex_prune_skips_an_unrecognised_layout
+test_codex_update_is_skipped_when_codex_is_not_installed
+test_codex_prune_spares_a_release_a_live_process_runs_from
+test_codex_prune_never_deletes_a_symlink_entry
+test_codex_prune_refuses_releases_outside_the_dev_home
+test_codex_prune_does_not_run_when_the_update_fails
 test_codex_connectors_file
 test_vscode_new_gcp_bootstrap_and_post_success_noop
 test_vscode_skips_existing_gcp_and_aws
@@ -3005,6 +3524,9 @@ test_claude_contract_rejects_empty_version
 test_claude_contract_rejects_missing_binary
 test_claude_installs_when_absent
 test_claude_second_run_is_a_noop
+test_claude_update_runs_as_dev_and_records_the_new_version
+test_claude_update_failure_is_not_fatal
+test_claude_broken_update_fails_and_removes_the_marker
 test_claude_record_success_is_stable_across_a_multiline_version
 test_claude_stale_marker_is_removed_before_failed_repair
 test_claude_successful_repair_recreates_the_marker

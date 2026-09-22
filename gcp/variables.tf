@@ -77,7 +77,8 @@ variable "toolchain" {
     # sha-pinned (policy 2026-08-16): the URLs float and a pin broke the
     # repair/bootstrap path on every legitimate installer update. Their
     # fetches rest on vendor-origin trust; the CLIs self-update after
-    # install.
+    # install, and every converge also runs `claude update` / `codex update`
+    # on boxes where they are already healthy.
     # Exact @getpaseo/cli version + sha256 of its registry tarball
     # (immutable per version — never goes stale on its own). Governs only
     # the unattended first-bootstrap install; dev-triggered in-app Paseo
