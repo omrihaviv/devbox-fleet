@@ -27,6 +27,7 @@ how to use it.
    - Clone the team's standard repos into `~/work/`
    - It also silently wires agent-completion notifications (see "Agent notifications" below)
 5. After that, you're done. Future SSH skips onboarding.
+6. **Optional — see the shared browser:** run `vncpasswd` once on the box, then open `vnc://<your-box's-tailscale-ip>:5901` to see and drive the Chrome your agents use. Details in [Steerable Chrome](#steerable-chrome-log-in-once-share-with-the-agent).
 
 ### Re-running onboarding
 
@@ -229,7 +230,7 @@ Docker Engine + Compose plugin are pre-installed. Both `/var/lib/docker` and `/v
 
 ## What if my box gets rebuilt?
 
-Your `/home` (work, auth tokens, git repos, Claude config), Docker images, and Tailscale identity all live on a persistent disk that survives instance rebuilds. After a rebuild, the onboarding marker `~/.devbox-onboarded` is still there, so onboarding does not re-run.
+Your `/home` (work, auth tokens, git repos, Claude config, the steered Chrome's logins and your VNC password), Docker images, and Tailscale identity all live on a persistent disk that survives instance rebuilds. After a rebuild, the onboarding marker `~/.devbox-onboarded` is still there, so onboarding does not re-run.
 
 The same applies to resizes: if you need more CPU, RAM, or disk, ask your admin — your box restarts once and everything on your disk stays.
 

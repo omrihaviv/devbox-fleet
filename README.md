@@ -35,7 +35,8 @@ flowchart LR
   box, its disks, snapshots, monitoring, and Tailscale access. Machine
   size, disks, and swap are chosen per machine.
 - **Agent-ready out of the box** — Claude Code, Codex CLI, and two Chrome
-  DevTools MCP servers preinstalled and wired up at first login.
+  DevTools MCP servers preinstalled and wired up at first login, plus a
+  shared Chrome you can watch and drive over VNC while the agent works.
 - **Reachable from anywhere, exposed to almost nothing** — Tailscale SSH
   from laptop or phone; no public application ports or SSH by default.
 - **Rebuilds are boring** — home, Docker images, and the box's Tailscale

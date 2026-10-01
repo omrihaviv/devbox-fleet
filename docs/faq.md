@@ -12,6 +12,8 @@
 
 **Is my box reachable from the internet?** — No public application ports or SSH by default: SSH only over Tailscale, port 22 open only to Google's IAP range for admin breakglass, and one public UDP port (41641) for WireGuard itself. You can deliberately share a port publicly with Tailscale Funnel — that's a feature, off by default.
 
+**Can I watch and steer the browser my agent uses?** — Yes. Every box runs one shared Chrome (`chrome-steered`) on a virtual screen: set a password with `vncpasswd`, open `vnc://<tailscale-ip>:5901`, log in to whatever the agent needs, and ask Claude to "use the steered Chrome". You can watch it work and take over at any point. See [Steerable Chrome](dev-quickstart.md#steerable-chrome-log-in-once-share-with-the-agent).
+
 **Who can reach my box besides me?** — Fleet admins, on every port, by design (incident response). Every tailnet member can reach dev-preview ports 3000/3005. The [security baseline](admin-runbook.md#security-baseline-accept-or-tighten-before-adding-devs) shows how to tighten both.
 
 **Does AWS/Azure work?** — GCP-only today. The optional `aws-federation/` root exists solely to give boxes AWS Bedrock access without AWS keys.
