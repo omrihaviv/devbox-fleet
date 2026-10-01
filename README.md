@@ -54,7 +54,7 @@ flowchart LR
 
 ## What's on every box
 
-Claude Code · Codex CLI · Chrome + DevTools MCP (ephemeral & steerable) ·
+Claude Code · Codex CLI · Chrome + DevTools MCP (ephemeral & steerable, with a VNC view) ·
 Docker + Compose · Node (NVM) · gh · AWS CLI · VS Code for the web · tmux +
 resurrect/continuum · mosh · [Paseo](https://github.com/getpaseo/paseo) ·
 earlyoom memory guardrails

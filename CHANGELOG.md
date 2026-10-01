@@ -14,6 +14,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The steered Chrome is now a visible browser window that devs see and drive
+  over VNC, rolled out by convergence (canary → promote, no rebuild). A new
+  `steered-display` toolchain step installs TigerVNC and openbox, runs the
+  virtual display `:1` as `devbox-vnc.service` (loopback-only, published to
+  the tailnet on `:5901`) with `devbox-openbox.service` as window manager, and
+  adds a drop-in that runs the boot template's `chrome-steered.service`
+  headful on that display. VNC logins use the dev's own `vncpasswd` password
+  and are refused until one is set. The agent still attaches over CDP on
+  `:9222`, so a dev can watch it work and take over. Chrome now runs with
+  `--password-store=basic`, the store the headless profiles already use, so
+  existing logins survive; the first converge restarts the steered Chrome
+  once, closing its open tabs.
 - Convergence now runs the vendors' own updaters on every 8h run, on boxes
   where the CLI is already installed: `claude update` and
   `codex update` (`CODEX_NON_INTERACTIVE=1`), each as `dev` under

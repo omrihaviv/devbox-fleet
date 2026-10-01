@@ -547,28 +547,46 @@ This creates/attaches `admin` while leaving the dev's `main` untouched. The dev 
 
 The long-lived Chrome that backs the `chrome-devtools-steered` MCP server is `chrome-steered.service` on each devbox. Chrome itself binds CDP (the Chrome DevTools Protocol) to `127.0.0.1:9222`; the boot script publishes that port to the tailnet via `tailscale serve --bg --tcp=9222 tcp://127.0.0.1:9222`, so a dev's laptop reaches it as `<dev>-devbox:9222` with no SSH tunnel.
 
+The boot template writes `chrome-steered.service` as a headless Chrome. Convergence (`devbox-toolchain`, step `steered-display`) turns it into a visible window devs drive over VNC, so this rolls out canary → promote with no rebuild:
+
+- packages `tigervnc-standalone-server`, `tigervnc-tools`, `openbox`;
+- `devbox-vnc.service` — TigerVNC `Xvnc` providing the virtual X display `:1` and serving it over VNC on `127.0.0.1:5901`, published to the tailnet with `tailscale serve --tcp=5901`;
+- `devbox-openbox.service` — the window manager on `:1`;
+- `/etc/systemd/system/chrome-steered.service.d/50-devbox-display.conf` — a drop-in that replaces the template's `ExecStart` with the same flags minus `--headless=new`, plus `DISPLAY=:1`, `--password-store=basic` (the cookie store headless profiles already use, so logins survive) and `--start-maximized`. A rebuild's bootstrap rewrites only the base unit, so the drop-in stays in force.
+
+The step restarts `chrome-steered` only while it still runs headless, so the first converge closes its open tabs once; later runs leave it alone. VNC uses `VncAuth` against the dev's own `~/.vnc/passwd` (set with `vncpasswd`); until it exists, every VNC login is refused while the display and Chrome keep running.
+
 Quick health probes:
 
 ```bash
+ssh dev@<dev>-devbox -t 'systemctl is-active devbox-vnc devbox-openbox chrome-steered'
 ssh dev@<dev>-devbox -t 'sudo systemctl status chrome-steered'
-ssh dev@<dev>-devbox -t 'sudo journalctl -u chrome-steered --since "1 hour ago"'
+ssh dev@<dev>-devbox -t 'sudo journalctl -u chrome-steered -u devbox-vnc --since "1 hour ago"'
 ssh dev@<dev>-devbox -t 'curl -fsS http://127.0.0.1:9222/json/version'
 ssh dev@<dev>-devbox -t 'tailscale serve status'
 ```
 
-The CDP `/json/version` probe is what the `chrome-devtools-mcp-steered-wrapper` itself uses as a readiness check; a healthy box returns a JSON body containing `webSocketDebuggerUrl`. `tailscale serve status` should show `tcp://:9222 → tcp://127.0.0.1:9222`.
+The CDP `/json/version` probe is what the `chrome-devtools-mcp-steered-wrapper` itself uses as a readiness check; a healthy box returns a JSON body containing `webSocketDebuggerUrl`. `tailscale serve status` should show `tcp://:9222 → tcp://127.0.0.1:9222` and `tcp://:5901 → tcp://127.0.0.1:5901`. Chrome logs `Failed to connect to the bus` lines because there is no desktop D-Bus session; they are harmless.
+
+Promoting an older manifest does **not** undo this: older toolchains don't know these files. To return one box to headless Chrome, remove them by hand (and promote a manifest without the step, or the next converge puts them back):
+
+```bash
+ssh dev@<dev>-devbox -t 'sudo rm /etc/systemd/system/chrome-steered.service.d/50-devbox-display.conf \
+  && sudo systemctl disable --now devbox-vnc devbox-openbox && sudo systemctl daemon-reload \
+  && sudo systemctl restart chrome-steered && tailscale serve --yes --tcp=5901 off'
+```
 
 ### Security baseline (accept or tighten before adding devs)
 
 By baseline:
 
-- The dev's Tailscale identity reaches `<their>-devbox:9222` — their own steered Chrome. `9222` is published to the tailnet by `tailscale serve` at boot, so no SSH tunnel is involved.
-- **Admins reach every devbox on every port, `:9222` included.** `admin_acl_rule` in `gcp/tailscale-acl.tf` grants `group:devbox-admins` the destination `tag:devbox-<key>:*` for every machine. Anyone holding an admin tailnet identity can therefore drive any dev's steered Chrome, with full access to whatever that dev is logged into in it (mail, chat, cloud consoles, internal dashboards).
+- The dev's Tailscale identity reaches `<their>-devbox:9222` (CDP) and `<their>-devbox:5901` (VNC, password-gated) — their own steered Chrome. `9222` is published to the tailnet by `tailscale serve` at boot and `5901` by convergence, so no SSH tunnel is involved.
+- **Admins reach every devbox on every port, `:9222` and `:5901` included.** `admin_acl_rule` in `gcp/tailscale-acl.tf` grants `group:devbox-admins` the destination `tag:devbox-<key>:*` for every machine. Anyone holding an admin tailnet identity can therefore drive any dev's steered Chrome over unauthenticated CDP, with full access to whatever that dev is logged into in it (mail, chat, cloud consoles, internal dashboards). The VNC password does not change that: CDP needs none, and `~/.vnc/passwd` is only obfuscated, so anyone with shell access as `dev` can recover it.
 - **Every tailnet member reaches ports 3000 and 3005 on every devbox** (`shared_dev_ports_rule`) — the shared dev-preview ports. Nothing else is shared between members.
 - **Every devbox tag carries the `funnel` node attribute** (`funnel_node_attrs` in `gcp/tailscale-acl.tf`), so any dev can expose a port on their own box to the **public internet** with Tailscale Funnel — a documented dev feature, not an accident. The same attribute is granted to `autogroup:member`, so it also covers each member's own untagged devices (the devbox tags are listed explicitly because `autogroup:member` excludes tagged nodes). If you do not want that reach, remove `funnel_node_attrs` from the rendered document and re-apply — note that this also breaks `tests/gcp-tailscale-test.sh`, which asserts the rendered ACL contains `funnel`; drop that assertion in the same change.
 - Chrome runs with `--remote-allow-origins=*` (in the `chrome-steered.service` unit written by the boot template). This relaxes Chrome's CDP **WebSocket Origin check** on `/devtools/page/<id>` upgrades — without it, the DevTools UI on a laptop cannot drive remote pages. It does NOT relax Chrome's **DNS-rebinding Host guard** on the HTTP discovery endpoints (`/json/*`); that guard hard-codes the allowed `Host:` to `localhost` or an IP literal and has no Chrome flag to extend it. Devs must therefore point `chrome://inspect` at the box's Tailscale IPv4 (e.g. `100.x.y.z:9222`), not the MagicDNS hostname.
 
-To **tighten** so admins cannot reach `:9222`: in `gcp/tailscale-acl.tf`, replace `admin_acl_rule`'s `tag:devbox-<key>:*` destination with the explicit port set admins should keep — e.g. `tag:devbox-<key>:22` for SSH only — and re-apply. Each dev's own per-machine rule is unaffected, so this costs admins port reach, not SSH. Breakglass over IAP is unaffected either way.
+To **tighten** so admins cannot reach `:9222` or `:5901`: in `gcp/tailscale-acl.tf`, replace `admin_acl_rule`'s `tag:devbox-<key>:*` destination with the explicit port set admins should keep — e.g. `tag:devbox-<key>:22` for SSH only — and re-apply. Each dev's own per-machine rule is unaffected, so this costs admins port reach, not SSH. Breakglass over IAP is unaffected either way.
 
 To **disable Serve entirely** on one box (revert it to an SSH-tunnel-only flow):
 
@@ -579,6 +597,8 @@ ssh dev@<dev>-devbox -t 'tailscale serve --yes --tcp=9222 off'
 The Serve config lives in tailscaled state on the persistent data disk (`/data/tailscale`), so `off` removes the mapping for that box only. It survives reboots and converges (no converge step touches `tailscale serve`), but **NOT a rebuild**: the boot script's one-time provisioning is gated by a marker on the root disk, a rebuild gives the instance a fresh root disk, and the re-run publishes `:9222` again. Re-apply `off` after every rebuild of that box. Re-enable normally with `tailscale serve --yes --bg --tcp=9222 tcp://127.0.0.1:9222`. `--yes` is required because `tailscale serve` prompts before modifying existing state, which would block any non-interactive invocation.
 
 Serve-off is therefore a courtesy setting, not a control: the box runs `tailscaled --operator=dev`, so the dev can re-publish `:9222` at any time (deliberately, or as collateral of a `tailscale funnel reset` / serve reconfiguration) without admin involvement. If admin or member reach to `:9222` must actually be prevented, the ACL edit above is the durable lever.
+
+`:5901` (VNC) differs: convergence re-publishes it on every run, so `tailscale serve --yes --tcp=5901 off` lasts only until the next converge. Use the ACL edit to keep it closed.
 
 ## Offboarding (integrity-first)
 

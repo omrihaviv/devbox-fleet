@@ -163,7 +163,7 @@ tailscale funnel 3005     # prints your public URL, then serves until you stop i
 
 Press **Ctrl-C** to stop — that cleanly removes just this funnel. Check what's live anytime with `tailscale funnel status` (read-only, no sudo). `dev` is a Tailscale operator, so you can start and stop Funnel without `sudo`.
 
-Prefer not to hold a shell open? `tailscale funnel --bg 3005` runs it in the background. But the only way to stop a backgrounded funnel is `tailscale funnel reset`, which clears the box's **entire** serve/funnel config — including the steered-Chrome `:9222` serve. If you hit that, restore it with `tailscale serve --yes --bg --tcp=9222 tcp://127.0.0.1:9222`.
+Prefer not to hold a shell open? `tailscale funnel --bg 3005` runs it in the background. But the only way to stop a backgrounded funnel is `tailscale funnel reset`, which clears the box's **entire** serve/funnel config — including the steered-Chrome `:9222` and `:5901` serves. If you hit that, restore them with `tailscale serve --yes --bg --tcp=9222 tcp://127.0.0.1:9222` and `tailscale serve --yes --bg --tcp=5901 tcp://127.0.0.1:5901`.
 
 **The URL is public and unauthenticated** — anyone who has it can reach that port. Only funnel what you mean to share, and stop it when you're done. Funnel serves on public port 443; to expose a second service at the same time, use `--https=8443` or `--https=10000`.
 
@@ -178,7 +178,15 @@ You have two Chrome MCP servers registered with Claude Code on the devbox:
 
 #### Steerable Chrome (log in once, share with the agent)
 
-`chrome-steered.service` runs continuously on the box. You drive it from your laptop; Claude attaches to the same browser to inherit whatever you've logged into.
+`chrome-steered.service` runs continuously on the box, as a normal Chrome window on a virtual screen. You see and drive that screen from your laptop over VNC; Claude attaches to the same browser to inherit whatever you've logged into.
+
+**One-time setup — set a VNC password** (VNC logins are refused until you do):
+
+```bash
+ssh dev@<your-name>-devbox vncpasswd
+```
+
+Pick at least 6 characters (only the first 8 count) and answer `n` to the view-only question. The password lives in `~/.vnc/passwd` on your persistent disk, so it survives rebuilds. Run `vncpasswd` again any time to change it; no restart needed.
 
 **To drive it:**
 
@@ -186,17 +194,19 @@ You have two Chrome MCP servers registered with Claude Code on the devbox:
    ```bash
    tailscale ip --4 <your-name>-devbox
    ```
-   You **must** use the IP, not the MagicDNS hostname — Chrome's CDP rejects hostnames (a DNS-rebinding guard no flag overrides). Tailscale IPs are stable across rebuilds.
-2. In your laptop's Chrome, open `chrome://inspect/#devices`, click **Configure...**, add `<that-ip>:9222`, close. No SSH tunnel — the devbox publishes 9222 to the tailnet via `tailscale serve`, and your Tailscale identity already reaches your box.
-3. The "Remote Target" list now shows pages open in the steered Chrome (initially `about:blank`). Click **inspect** to open DevTools — the **Sources / Console / Network** panels work as usual, and **More Tools → Remote Devices → screencast** gives you a clickable, typable view of the page. Navigate, log in, complete MFA. Auth state lands in `/home/dev/.local/share/chrome-steered/` on the box and survives instance rebuilds (it's on your persistent disk).
+2. Open `vnc://<that-ip>:5901` — on a Mac, paste it into Finder's **Go → Connect to Server** (built-in Screen Sharing); elsewhere use any VNC client. Enter the VNC password. No SSH tunnel — the devbox publishes 5901 to the tailnet via `tailscale serve`, and your Tailscale identity already reaches your box.
+3. You now see the steered Chrome: tabs, address bar, extensions, file pickers. Navigate, log in, complete MFA. Auth state lands in `/home/dev/.local/share/chrome-steered/` on the box and survives instance rebuilds (it's on your persistent disk).
 
-**To hand off to an agent:** ask Claude to "use the steered Chrome" (or name `chrome-devtools-steered` explicitly). The agent opens a fresh tab in the same Chrome process and inherits your cookies/local-storage. When the agent is done, your tab in `chrome://inspect` is unaffected.
+**To hand off to an agent:** ask Claude to "use the steered Chrome" (or name `chrome-devtools-steered` explicitly). The agent opens a tab in the same Chrome window and inherits your cookies/local-storage. Keep the VNC window open to watch it work, and take over at any point (a CAPTCHA, an MFA prompt), then hand back.
 
-**To stop / restart:** `sudo systemctl stop chrome-steered` and `sudo systemctl start chrome-steered` on the box. The service auto-restarts on crash (`Restart=always`).
+**DevTools instead of VNC:** the CDP endpoint is still published on 9222. In your laptop's Chrome, open `chrome://inspect/#devices`, click **Configure...**, add `<that-ip>:9222`, then **inspect** a page for the **Sources / Console / Network** panels. You **must** use the IP, not the MagicDNS hostname — Chrome's CDP rejects hostnames (a DNS-rebinding guard no flag overrides). Tailscale IPs are stable across rebuilds.
+
+**To stop / restart:** `sudo systemctl stop chrome-steered` and `sudo systemctl start chrome-steered` on the box. The service auto-restarts on crash (`Restart=always`) — and when you close its last window, so closing the window is a quick way to restart Chrome (open tabs are lost; logins are kept). The screen itself is `devbox-vnc.service` (with `devbox-openbox.service` as its window manager); Chrome reconnects on its own if it restarts.
 
 **Caveats:**
-- Only one chrome://inspect viewer at a time gives a clean experience; opening from a second laptop will cause render/input contention on the same page.
-- Password autofill from your laptop's keychain does NOT cross the screencast boundary — type, paste, or use email-link login.
+- Hardware security keys and your laptop's passkeys do NOT reach the box over VNC — use an authenticator app, push, or email-link login.
+- Your laptop's password manager does NOT reach the box either — type, paste (if your VNC client shares the clipboard), or install your password manager's extension in the steered Chrome.
+- Two viewers at once (VNC from two laptops, or VNC plus a `chrome://inspect` screencast) fight over the same mouse and keyboard; use one at a time.
 - The steered Chrome is a creds aggregator: anyone with shell access as `dev` on the box can drive it. Tailscale identity + your SSH key are the access boundary. Be deliberate about which orgs you log into.
 
 #### Ephemeral Chrome (`chrome-devtools` MCP)

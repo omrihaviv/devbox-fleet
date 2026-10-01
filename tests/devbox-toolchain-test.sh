@@ -42,6 +42,7 @@ case "$package" in
   nodejs) echo "$DEVBOX_SYSTEM_NODE_VERSION" ;;
   google-chrome-stable) echo "$DEVBOX_GOOGLE_CHROME_VERSION" ;;
   git|make|build-essential|jq|unzip|mosh|tmux|htop|ripgrep|fd-find|containerd.io|docker-compose-plugin|libnss3|libgbm1|libasound2t64|fonts-liberation) exit 0 ;;
+  tigervnc-standalone-server|tigervnc-tools|openbox) [ "${DEVBOX_TEST_DISPLAY_PACKAGES_INSTALLED:-0}" = 1 ] ;;
   *) exit 1 ;;
 esac
 EOF
@@ -160,6 +161,23 @@ case "$*" in
     ;;
   "enable --now paseo.service")
     touch "$PASEO_DAEMON_SERVICE_FILE.enabled"
+    ;;
+  "show -p NeedDaemonReload --value devbox-vnc.service devbox-openbox.service chrome-steered.service")
+    printf '%s\n' "${DEVBOX_TEST_DISPLAY_NEEDS_RELOAD:-no}"
+    ;;
+  "is-enabled --quiet devbox-vnc.service"|"is-active --quiet devbox-vnc.service"|"is-enabled --quiet devbox-openbox.service"|"is-active --quiet devbox-openbox.service")
+    [ -f "$DEVBOX_TEST_LOG.display-enabled" ]
+    ;;
+  "enable --now devbox-vnc.service devbox-openbox.service")
+    touch "$DEVBOX_TEST_LOG.display-enabled"
+    ;;
+  "show chrome-steered.service -p MainPID --value")
+    printf '%s\n' "${DEVBOX_TEST_CHROME_STEERED_PID:-0}"
+    ;;
+  "restart chrome-steered.service")
+    # The restarted Chrome runs the loaded (drop-in) command line.
+    printf '%s\0' /usr/bin/google-chrome-stable --remote-debugging-port=9222 \
+      > "$DEVBOX_TEST_PROC_ROOT/$DEVBOX_TEST_CHROME_STEERED_PID/cmdline"
     ;;
 esac
 EOF
@@ -600,6 +618,17 @@ case "$*" in
   "serve --yes --bg 8000")
     echo "tailscale $*" >> "$DEVBOX_TEST_VSCODE_LAUNCH_LOG"
     [ "${DEVBOX_TEST_TAILSCALE_SERVE_FAIL:-0}" != 1 ] || exit 47
+    ;;
+  "serve status --json")
+    if [ -f "$DEVBOX_TEST_LOG.serve-5901" ]; then
+      printf '{"TCP":{"5901":{"TCPForward":"127.0.0.1:5901"}}}\n'
+    else
+      printf '{}\n'
+    fi
+    ;;
+  "serve --yes --bg --tcp=5901 tcp://127.0.0.1:5901")
+    echo "tailscale $*" >> "$DEVBOX_TEST_LOG"
+    touch "$DEVBOX_TEST_LOG.serve-5901"
     ;;
   *)
     echo "unexpected tailscale $*" >&2
@@ -3456,6 +3485,205 @@ test_needrestart_defers_paseo_before_package_work() {
     || fail "Paseo protection is not installed before package convergence"
 }
 
+extract_steered_display_step() {
+  local out="$1" fn
+  {
+    printf '%s\n' 'APT_GET=(apt-get -o DPkg::Lock::Timeout=300)' 'apt_updated=false' 'apt_needs_update=false'
+    for fn in install_if_changed apt_update_if_needed ensure_apt_package ensure_steered_display; do
+      sed -n "/^${fn}()/,/^}/p" "$repo_root/scripts/devbox-toolchain"
+    done
+  } > "$out"
+  grep -q '^ensure_steered_display()' "$out" || fail "could not extract ensure_steered_display"
+}
+
+run_steered_display_step() {
+  local workdir="$1"
+  local function_file="$workdir/ensure-steered-display.sh"
+
+  extract_steered_display_step "$function_file"
+  DEVBOX_TEST_LOG="$workdir/commands.log" \
+    DEVBOX_TEST_PROC_ROOT="$workdir/proc" \
+    DEVBOX_TEST_CHROME_STEERED_PID="${DEVBOX_TEST_CHROME_STEERED_PID:-0}" \
+    DEVBOX_TEST_DISPLAY_NEEDS_RELOAD="${DEVBOX_TEST_DISPLAY_NEEDS_RELOAD:-no}" \
+    DEVBOX_TEST_DISPLAY_PACKAGES_INSTALLED="${DEVBOX_TEST_DISPLAY_PACKAGES_INSTALLED:-0}" \
+    DEVBOX_TEST_DAEMON_RELOAD_FAIL="${DEVBOX_TEST_DAEMON_RELOAD_FAIL:-0}" \
+    DEV_USER="$test_user" \
+    DEV_HOME="$workdir/home" \
+    GCP_RUNTIME_BUCKET_FILE="$workdir/etc/devbox/runtime-bucket" \
+    CHROME_BIN=/usr/bin/google-chrome-stable \
+    TAILSCALE_BIN="$workdir/fake-bin/tailscale" \
+    PROC_ROOT="$workdir/proc" \
+    VNC_SERVICE_FILE="$workdir/etc/systemd/system/devbox-vnc.service" \
+    OPENBOX_SERVICE_FILE="$workdir/etc/systemd/system/devbox-openbox.service" \
+    CHROME_STEERED_DROPIN_FILE="$workdir/etc/systemd/system/chrome-steered.service.d/50-devbox-display.conf" \
+    PATH="$workdir/fake-bin:$PATH" \
+    bash -c 'set -euo pipefail; source "$1"; ensure_steered_display' _ "$function_file"
+}
+
+# A GCP box whose boot template already runs chrome-steered headless as PID 4242.
+seed_steered_display_box() {
+  local workdir="$1"
+  make_fake_bin "$workdir/fake-bin"
+  mkdir -p "$workdir/etc/devbox" "$workdir/proc/4242" "$workdir/home"
+  printf 'bucket\n' > "$workdir/etc/devbox/runtime-bucket"
+  printf '%s\0' /usr/bin/google-chrome-stable --headless=new --remote-debugging-port=9222 \
+    > "$workdir/proc/4242/cmdline"
+}
+
+line_in_log() {
+  { grep -nxF -- "$2" "$1" || true; } | head -1 | cut -d: -f1
+}
+
+test_steered_display_first_run_makes_chrome_visible_and_publishes_vnc() {
+  local workdir vnc openbox dropin reload_line enable_line restart_line package
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_steered_display_box "$workdir"
+  vnc="$workdir/etc/systemd/system/devbox-vnc.service"
+  openbox="$workdir/etc/systemd/system/devbox-openbox.service"
+  dropin="$workdir/etc/systemd/system/chrome-steered.service.d/50-devbox-display.conf"
+
+  DEVBOX_TEST_CHROME_STEERED_PID=4242 run_steered_display_step "$workdir" > "$workdir/out" \
+    || fail "steered display first run failed"
+
+  for package in tigervnc-standalone-server tigervnc-tools openbox; do
+    grep -qF "install -y $package" "$workdir/commands.log" || fail "did not install $package"
+  done
+  # Loopback-only and password-gated: VNC stays closed until the dev runs vncpasswd.
+  grep -qF 'ExecStart=/usr/bin/Xvnc :1 -localhost -rfbport 5901 ' "$vnc" || fail "Xvnc is not on :1/5901 loopback-only"
+  grep -qF -- "-SecurityTypes VncAuth -PasswordFile $workdir/home/.vnc/passwd " "$vnc" || fail "VNC is not gated by the dev's vncpasswd file"
+  grep -qxF "User=$test_user" "$vnc" || fail "Xvnc does not run as the dev user"
+  grep -qxF 'ExecStart=/usr/bin/openbox' "$openbox" || fail "openbox unit missing its ExecStart"
+  grep -qxF 'Environment=DISPLAY=:1' "$openbox" || fail "openbox is not on display :1"
+  # The drop-in resets the template's headless ExecStart and runs Chrome on :1.
+  grep -qxF 'ExecStart=' "$dropin" || fail "drop-in does not reset the template ExecStart"
+  grep -qxF 'Environment=DISPLAY=:1' "$dropin" || fail "drop-in does not put Chrome on display :1"
+  grep -qxF 'Wants=devbox-vnc.service devbox-openbox.service' "$dropin" || fail "drop-in does not pull in the display"
+  if grep -qF -- '--headless' "$dropin"; then fail "drop-in still runs Chrome headless"; fi
+  grep -qF -- '--password-store=basic' "$dropin" || fail "drop-in does not pin the basic cookie store"
+
+  reload_line="$(line_in_log "$workdir/commands.log" 'systemctl daemon-reload')"
+  enable_line="$(line_in_log "$workdir/commands.log" 'systemctl enable --now devbox-vnc.service devbox-openbox.service')"
+  restart_line="$(line_in_log "$workdir/commands.log" 'systemctl restart chrome-steered.service')"
+  [ -n "$reload_line" ] && [ -n "$enable_line" ] && [ -n "$restart_line" ] \
+    || { cat "$workdir/commands.log" >&2; fail "expected daemon-reload, display enable and Chrome restart"; }
+  [ "$reload_line" -lt "$enable_line" ] && [ "$enable_line" -lt "$restart_line" ] \
+    || fail "Chrome must restart only after the display units are loaded and running"
+  grep -qxF 'tailscale serve --yes --bg --tcp=5901 tcp://127.0.0.1:5901' "$workdir/commands.log" \
+    || fail "VNC port was not published to the tailnet"
+}
+
+test_steered_display_steady_state_is_noop() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_steered_display_box "$workdir"
+
+  DEVBOX_TEST_CHROME_STEERED_PID=4242 run_steered_display_step "$workdir" > /dev/null \
+    || fail "steered display first run failed"
+  : > "$workdir/commands.log"
+  DEVBOX_TEST_CHROME_STEERED_PID=4242 DEVBOX_TEST_DISPLAY_PACKAGES_INSTALLED=1 \
+    run_steered_display_step "$workdir" > /dev/null || fail "steered display second run failed"
+
+  if grep -Eq 'install -y|daemon-reload|enable --now|restart|tailscale serve --yes' "$workdir/commands.log"; then
+    cat "$workdir/commands.log" >&2
+    fail "a converged box must not reinstall, reload, restart Chrome or re-publish"
+  fi
+}
+
+# On a fresh box the boot-time converge runs before the template writes
+# chrome-steered.service: lay down the display and drop-in, restart nothing.
+test_steered_display_before_bootstrap_writes_chrome_steered() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_steered_display_box "$workdir"
+
+  DEVBOX_TEST_CHROME_STEERED_PID=0 run_steered_display_step "$workdir" > /dev/null \
+    || fail "steered display failed before chrome-steered exists"
+
+  [ -f "$workdir/etc/systemd/system/chrome-steered.service.d/50-devbox-display.conf" ] \
+    || fail "drop-in must be in place before the template writes the base unit"
+  grep -qxF 'systemctl enable --now devbox-vnc.service devbox-openbox.service' "$workdir/commands.log" \
+    || fail "display units were not started"
+  if grep -qF 'restart chrome-steered' "$workdir/commands.log"; then
+    fail "must not restart a chrome-steered that is not running"
+  fi
+}
+
+test_steered_display_retries_a_failed_daemon_reload() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_steered_display_box "$workdir"
+
+  if DEVBOX_TEST_CHROME_STEERED_PID=4242 DEVBOX_TEST_DAEMON_RELOAD_FAIL=1 \
+      run_steered_display_step "$workdir" > /dev/null 2>&1; then
+    fail "a failed daemon-reload must fail the step"
+  fi
+  if grep -qF 'restart chrome-steered' "$workdir/commands.log"; then
+    fail "Chrome must not restart onto a unit systemd has not reloaded"
+  fi
+
+  : > "$workdir/commands.log"
+  DEVBOX_TEST_CHROME_STEERED_PID=4242 DEVBOX_TEST_DISPLAY_PACKAGES_INSTALLED=1 DEVBOX_TEST_DISPLAY_NEEDS_RELOAD=yes \
+    run_steered_display_step "$workdir" > /dev/null || fail "retry after a failed reload failed"
+  grep -qxF 'systemctl daemon-reload' "$workdir/commands.log" \
+    || fail "unchanged files with a pending reload must still reload systemd"
+  grep -qxF 'systemctl restart chrome-steered.service' "$workdir/commands.log" \
+    || fail "the still-headless Chrome was not restarted on the retry"
+}
+
+test_steered_display_skips_boxes_outside_the_gcp_fleet() {
+  local workdir
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_steered_display_box "$workdir"
+  rm -f "$workdir/etc/devbox/runtime-bucket"
+
+  DEVBOX_TEST_CHROME_STEERED_PID=4242 run_steered_display_step "$workdir" > /dev/null \
+    || fail "steered display failed outside the GCP fleet"
+  [ ! -e "$workdir/etc/systemd" ] || fail "wrote systemd units on a box outside the GCP fleet"
+  [ ! -s "$workdir/commands.log" ] || fail "ran commands on a box outside the GCP fleet"
+}
+
+# The drop-in replaces the boot template's ExecStart wholesale, so it must
+# carry every template flag except --headless; drift here silently changes
+# the Chrome launch surface.
+test_steered_display_dropin_keeps_the_template_chrome_flags() {
+  local workdir template_flags dropin_flags expected
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  seed_steered_display_box "$workdir"
+  DEVBOX_TEST_CHROME_STEERED_PID=0 run_steered_display_step "$workdir" > /dev/null \
+    || fail "steered display run failed"
+
+  template_flags="$(sed -n "/<<'CHROME_STEERED_EOF'/,/^CHROME_STEERED_EOF\$/p" \
+      "$repo_root/gcp/templates/startup-script.sh.tftpl" \
+    | sed -n '/^ExecStart=/,/[^\\]$/p' | tr -d '\\' | tr -s ' \n' '\n' | sed '1d' | grep -v '^$')"
+  [ -n "$template_flags" ] || fail "could not read the template chrome-steered ExecStart"
+  expected="$( { grep -vx -- '--headless=new' <<<"$template_flags"; printf '%s\n' --password-store=basic --start-maximized; } | sort)"
+  dropin_flags="$(grep '^ExecStart=.' "$workdir/etc/systemd/system/chrome-steered.service.d/50-devbox-display.conf" \
+    | tr ' ' '\n' | sed '1d' | sed "s#$workdir/home#/home/dev#" | sort)"
+  [ "$dropin_flags" = "$expected" ] \
+    || fail "drop-in Chrome flags drifted from the template: $(diff <(echo "$expected") <(echo "$dropin_flags") | tr '\n' ' ')"
+}
+
+test_steered_display_runs_after_chrome_is_installed() {
+  local chrome_line display_line
+  chrome_line="$(grep -n '^run_tool google-chrome ' "$repo_root/scripts/devbox-toolchain" | cut -d: -f1)"
+  display_line="$(grep -n '^run_tool steered-display ensure_steered_display$' "$repo_root/scripts/devbox-toolchain" | cut -d: -f1)"
+  [ -n "$display_line" ] || fail "ensure_steered_display is not dispatched by the toolchain"
+  [ "$chrome_line" -lt "$display_line" ] || fail "steered display must run after Chrome is installed"
+}
+
+test_steered_display_first_run_makes_chrome_visible_and_publishes_vnc
+test_steered_display_steady_state_is_noop
+test_steered_display_before_bootstrap_writes_chrome_steered
+test_steered_display_retries_a_failed_daemon_reload
+test_steered_display_skips_boxes_outside_the_gcp_fleet
+test_steered_display_dropin_keeps_the_template_chrome_flags
+test_steered_display_runs_after_chrome_is_installed
 test_require_env_fails_closed_without_the_pin_env
 test_cli_updates_are_bounded
 test_needrestart_defers_paseo_before_package_work

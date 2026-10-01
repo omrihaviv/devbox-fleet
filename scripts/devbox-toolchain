@@ -58,6 +58,9 @@ TMUX_PLUGINS_DIR="${DEVBOX_TMUX_PLUGINS_DIR:-/opt/tmux-plugins}"
 TMUX_CONF_FILE="${DEVBOX_TMUX_CONF_FILE:-$DEV_HOME/.tmux.conf}"
 TMUX_BIN="${DEVBOX_TMUX_BIN:-/usr/bin/tmux}"
 TMUX_SOCKET="${DEVBOX_TMUX_SOCKET:-}" # default: /tmp/tmux-<dev uid>/default, resolved at use
+VNC_SERVICE_FILE="${DEVBOX_VNC_SERVICE_FILE:-/etc/systemd/system/devbox-vnc.service}"
+OPENBOX_SERVICE_FILE="${DEVBOX_OPENBOX_SERVICE_FILE:-/etc/systemd/system/devbox-openbox.service}"
+CHROME_STEERED_DROPIN_FILE="${DEVBOX_CHROME_STEERED_DROPIN_FILE:-/etc/systemd/system/chrome-steered.service.d/50-devbox-display.conf}"
 
 apt_updated=false
 apt_needs_update=false
@@ -1499,6 +1502,117 @@ ensure_chrome_devtools_mcp() {
   done
 }
 
+# Makes the steered Chrome a visible window devs drive over VNC: Xvnc display
+# :1 (VNC on 127.0.0.1:5901, published to the tailnet) with openbox, plus a
+# drop-in over the boot template's headless chrome-steered.service. Delivered
+# here rather than in the template so no box needs a rebuild; a drop-in, not
+# a rewrite, because a rebuild's bootstrap rewrites only the base unit.
+ensure_steered_display() {
+  local package tmpdir changed=false main_pid
+
+  # The boot template that owns chrome-steered.service exists only on the
+  # runtime-managed GCP fleet.
+  if [ ! -f "$GCP_RUNTIME_BUCKET_FILE" ]; then
+    return 0
+  fi
+
+  for package in tigervnc-standalone-server tigervnc-tools openbox; do
+    ensure_apt_package "$package"
+  done
+
+  tmpdir="$(mktemp -d)"
+  cat > "$tmpdir/vnc" <<EOF
+[Unit]
+Description=Virtual X display :1 for chrome-steered, VNC on 127.0.0.1:5901
+RequiresMountsFor=$DEV_HOME
+
+[Service]
+User=$DEV_USER
+Group=$DEV_USER
+Environment=HOME=$DEV_HOME
+# VncAuth reads the password file on every connection: the display runs from
+# boot, but VNC logins are refused until the dev runs vncpasswd.
+ExecStart=/usr/bin/Xvnc :1 -localhost -rfbport 5901 -geometry 1920x1080 -SecurityTypes VncAuth -PasswordFile $DEV_HOME/.vnc/passwd -desktop steered-chrome
+# Hold dependents (openbox, Chrome) until the X socket accepts clients.
+ExecStartPost=/bin/sh -c 'until [ -S /tmp/.X11-unix/X1 ]; do sleep 0.2; done'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "$tmpdir/openbox" <<EOF
+[Unit]
+Description=Window manager on display :1 (popups and dialogs for chrome-steered)
+After=devbox-vnc.service
+Wants=devbox-vnc.service
+
+[Service]
+User=$DEV_USER
+Group=$DEV_USER
+Environment=HOME=$DEV_HOME
+Environment=DISPLAY=:1
+ExecStart=/usr/bin/openbox
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  # ExecStart must keep every flag of the template's unit except --headless
+  # (tests/devbox-toolchain-test.sh enforces it).
+  cat > "$tmpdir/dropin" <<EOF
+# Managed by devbox-toolchain: runs chrome-steered as a visible window on
+# display :1 (devbox-vnc.service) instead of headless.
+[Unit]
+After=devbox-vnc.service devbox-openbox.service
+Wants=devbox-vnc.service devbox-openbox.service
+
+[Service]
+Environment=DISPLAY=:1
+# --password-store=basic: profiles created while this Chrome was headless
+# hold cookies under the basic key; pinning it keeps those logins readable.
+# Closing the window exits Chrome; the base unit's Restart=always restarts it.
+ExecStart=
+ExecStart=$CHROME_BIN --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=* --user-data-dir=$DEV_HOME/.local/share/chrome-steered --password-store=basic --start-maximized --disable-gpu --no-first-run --no-default-browser-check about:blank
+EOF
+
+  if install_if_changed "$tmpdir/vnc" "$VNC_SERVICE_FILE" 0644; then changed=true; fi
+  if install_if_changed "$tmpdir/openbox" "$OPENBOX_SERVICE_FILE" 0644; then changed=true; fi
+  if install_if_changed "$tmpdir/dropin" "$CHROME_STEERED_DROPIN_FILE" 0644; then changed=true; fi
+  rm -rf "$tmpdir"
+
+  # Unchanged files can still be stale in systemd if a prior reload failed.
+  if [ "$changed" = true ] \
+      || systemctl show -p NeedDaemonReload --value \
+        devbox-vnc.service devbox-openbox.service chrome-steered.service | grep -qx yes; then
+    systemctl daemon-reload
+  fi
+
+  if ! systemctl is-enabled --quiet devbox-vnc.service \
+      || ! systemctl is-active --quiet devbox-vnc.service \
+      || ! systemctl is-enabled --quiet devbox-openbox.service \
+      || ! systemctl is-active --quiet devbox-openbox.service; then
+    systemctl enable --now devbox-vnc.service devbox-openbox.service
+  fi
+
+  # Restart only a Chrome still running the old headless command line; this
+  # closes its tabs once (logins persist). MainPID is 0 when chrome-steered is
+  # stopped or, on a fresh box, not yet written by the template.
+  main_pid="$(systemctl show chrome-steered.service -p MainPID --value)"
+  if [ "${main_pid:-0}" != 0 ] \
+      && tr '\0' '\n' < "$PROC_ROOT/$main_pid/cmdline" | grep -q '^--headless'; then
+    echo "steered-display: restarting chrome-steered onto display :1"
+    systemctl restart chrome-steered.service
+  fi
+
+  if ! "$TAILSCALE_BIN" serve status --json \
+      | jq -e '.TCP["5901"].TCPForward == "127.0.0.1:5901"' >/dev/null; then
+    "$TAILSCALE_BIN" serve --yes --bg --tcp=5901 tcp://127.0.0.1:5901
+    echo "steered-display: published VNC (5901) to the tailnet"
+  fi
+}
+
 ensure_aws_cli() {
   local installed=""
   local aws_tmp
@@ -1558,6 +1672,7 @@ run_tool agent-plugins ensure_agent_plugins
 run_tool tmux-plugins ensure_tmux_plugins
 run_tool google-chrome ensure_google_chrome
 run_tool chrome-devtools-mcp ensure_chrome_devtools_mcp
+run_tool steered-display ensure_steered_display
 run_tool aws-cli ensure_aws_cli
 
 if [ "${#failures[@]}" -ne 0 ]; then
