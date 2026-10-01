@@ -27,7 +27,7 @@ how to use it.
    - Clone the team's standard repos into `~/work/`
    - It also silently wires agent-completion notifications (see "Agent notifications" below)
 5. After that, you're done. Future SSH skips onboarding.
-6. **Optional — see the shared browser:** run `vncpasswd` once on the box, then open `vnc://<your-box's-tailscale-ip>:5901` to see and drive the Chrome your agents use. Details in [Steerable Chrome](#steerable-chrome-log-in-once-share-with-the-agent).
+6. **Optional — see the shared browser:** run `vncpasswd` once on the box, then connect a VNC client (on a Mac, TigerVNC Viewer — Screen Sharing can't paste) to `<your-box's-tailscale-ip>:5901` to see and drive the Chrome your agents use. Details in [Steerable Chrome](#steerable-chrome-log-in-once-share-with-the-agent).
 
 ### Re-running onboarding
 
@@ -195,7 +195,7 @@ Pick at least 6 characters (only the first 8 count) and answer `n` to the view-o
    ```bash
    tailscale ip --4 <your-name>-devbox
    ```
-2. Open `vnc://<that-ip>:5901` — on a Mac, paste it into Finder's **Go → Connect to Server** (built-in Screen Sharing); elsewhere use any VNC client. Enter the VNC password. No SSH tunnel — the devbox publishes 5901 to the tailnet via `tailscale serve`, and your Tailscale identity already reaches your box.
+2. Connect a VNC client to `<that-ip>:5901` and enter the VNC password. Use a client that shares the clipboard — on a Mac, [TigerVNC Viewer](https://tigervnc.org) (`brew install --cask tigervnc`). macOS's built-in Screen Sharing (`vnc://<that-ip>:5901`) connects too, but it does not send your Mac's clipboard to the box, so pasting into the browser fails. No SSH tunnel — the devbox publishes 5901 to the tailnet via `tailscale serve`, and your Tailscale identity already reaches your box.
 3. You now see the steered Chrome: tabs, address bar, extensions, file pickers. Navigate, log in, complete MFA. Auth state lands in `/home/dev/.local/share/chrome-steered/` on the box and survives instance rebuilds (it's on your persistent disk).
 
 **To hand off to an agent:** ask Claude to "use the steered Chrome" (or name `chrome-devtools-steered` explicitly). The agent opens a tab in the same Chrome window and inherits your cookies/local-storage. Keep the VNC window open to watch it work, and take over at any point (a CAPTCHA, an MFA prompt), then hand back.
@@ -206,7 +206,8 @@ Pick at least 6 characters (only the first 8 count) and answer `n` to the view-o
 
 **Caveats:**
 - Hardware security keys and your laptop's passkeys do NOT reach the box over VNC — use an authenticator app, push, or email-link login.
-- Your laptop's password manager does NOT reach the box either — type, paste (if your VNC client shares the clipboard), or install your password manager's extension in the steered Chrome.
+- Copy and paste work both ways with a clipboard-sharing client such as TigerVNC Viewer (not macOS Screen Sharing). Inside the remote Chrome use **Ctrl**+C / **Ctrl**+V — it runs on Linux, so ⌘ shortcuts don't apply.
+- Your laptop's password manager does NOT reach the box either — type, paste, or install your password manager's extension in the steered Chrome.
 - Two viewers at once (VNC from two laptops, or VNC plus a `chrome://inspect` screencast) fight over the same mouse and keyboard; use one at a time.
 - The steered Chrome is a creds aggregator: anyone with shell access as `dev` on the box can drive it. Tailscale identity + your SSH key are the access boundary. Be deliberate about which orgs you log into.
 
