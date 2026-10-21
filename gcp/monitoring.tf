@@ -56,6 +56,38 @@ resource "google_monitoring_alert_policy" "converge_stale" {
   }
 }
 
+# Evaluated per machine and filesystem. A full data disk kills the Paseo
+# daemon with ENOSPC, and ext4's 5% root reserve means the dev hits ENOSPC at
+# ~95%, so 90% leaves time to clean up or grow the disk. Snap squashfs loop
+# devices always read 100%, so they are excluded.
+resource "google_monitoring_alert_policy" "disk_nearly_full" {
+  count = var.devbox_alert_email == "" || length(local.machines) == 0 ? 0 : 1
+
+  display_name = "devbox disk nearly full (>90%)"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "disk used > 90% for 15m (per machine and filesystem)"
+    condition_threshold {
+      filter          = "resource.type = \"gce_instance\" AND metric.type = \"agent.googleapis.com/disk/percent_used\" AND metric.labels.state = \"used\" AND NOT metric.labels.device = starts_with(\"/dev/loop\")"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 90
+      duration        = "900s"
+
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.devbox_email[0].id]
+
+  documentation {
+    content = "A devbox filesystem is over 90% full (the incident labels name the instance and device; /dev/sdb is the data disk holding /home/dev). Near 95% the dev gets ENOSPC and the Paseo daemon dies. Have the dev free space (`du -xh -d2 ~ | sort -h | tail`, `docker system df`), or grow the disk. Runbook: docs/admin-runbook.md, Routine operations → Grow the data disk."
+  }
+}
+
 # Fleet investigation dashboard: per-machine host metrics. Per-process
 # detail lives in each VM's Observability tab (Ops Agent processes
 # receiver, Task 6) and Metrics Explorer under agent.googleapis.com/processes/*.

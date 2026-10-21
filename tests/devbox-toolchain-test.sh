@@ -2284,6 +2284,10 @@ test_paseo_success_reconciles_boot_enabled_daemon() {
 #!/usr/bin/env bash
 printf 'paseo %s\n' "$*" >> "$DEVBOX_TEST_PASEO_RUNTIME_LOG"
 case "$*" in
+  "--version")
+    printf '0.4.0\n'
+    exit 0
+    ;;
   "daemon status"|"daemon status --json")
     printf '{"localDaemon":"stopped"}\n'
     exit 0
@@ -2367,6 +2371,9 @@ case "$*" in
       printf '{"localDaemon":"stopped","pid":null}\n'
     fi
     ;;
+  "--version")
+    printf '0.4.0\n'
+    ;;
   "daemon start --foreground")
     ;;
   *)
@@ -2394,6 +2401,59 @@ EOF
     || fail "Paseo daemon runner interrupted the existing detached daemon"
   tail -1 "$workdir/paseo-runtime.log" | grep -qxF 'paseo daemon start --foreground' \
     || fail "Paseo daemon runner did not take over after the detached daemon exited"
+}
+
+# Paseo 0.9.0 replaced `daemon start --foreground` with `daemon run`, and the
+# in-app updater can move a box across that line after the pinned install.
+test_paseo_daemon_runner_picks_foreground_command_by_version() {
+  local workdir version expected
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+
+  make_fake_bin "$workdir/fake-bin"
+  mkdir -p "$workdir/etc/devbox" "$workdir/home/.paseo" "$workdir/usr/bin" \
+    "$workdir/var/lib/devbox-bootstrap" "$workdir/var/lib/devbox-runtime"
+  : > "$workdir/etc/devbox/runtime-bucket"
+  : > "$workdir/var/lib/devbox-bootstrap/complete"
+  : > "$workdir/var/lib/devbox-runtime/paseo-installed"
+  printf '{}\n' > "$workdir/home/.paseo/config.json"
+  cat > "$workdir/usr/bin/paseo" <<'EOF'
+#!/usr/bin/env bash
+printf 'paseo %s\n' "$*" >> "$DEVBOX_TEST_PASEO_RUNTIME_LOG"
+case "$*" in
+  "--version")
+    printf '%s\n' "$DEVBOX_TEST_PASEO_VERSION"
+    ;;
+  "daemon status --json")
+    printf '{"localDaemon":"stopped"}\n'
+    ;;
+  "daemon run"|"daemon start --foreground")
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+  chmod 0755 "$workdir/usr/bin/paseo"
+
+  run_paseo_step "$workdir"
+
+  while read -r version expected; do
+    rm -f "$workdir/paseo-runtime.log"
+    DEVBOX_TEST_PASEO_RUNTIME_LOG="$workdir/paseo-runtime.log" \
+      DEVBOX_TEST_PASEO_VERSION="$version" \
+      "$workdir/usr/local/bin/devbox-paseo-daemon"
+    [ "$(tail -1 "$workdir/paseo-runtime.log")" = "paseo $expected" ] \
+      || fail "Paseo $version daemon runner did not exec '$expected'"
+    [ "$(grep -c '^paseo daemon \(run\|start\)' "$workdir/paseo-runtime.log")" -eq 1 ] \
+      || fail "Paseo $version daemon runner tried more than one foreground command"
+  done <<'EOF'
+0.4.0 daemon start --foreground
+0.8.0 daemon start --foreground
+0.9.0 daemon run
+0.10.3 daemon run
+0.12.0 daemon run
+EOF
 }
 
 test_paseo_daemon_reload_failure_is_retryable() {
@@ -3693,6 +3753,7 @@ test_paseo_tarball_sha_mismatch_retains_retry_marker
 test_paseo_pinned_version_mismatch_retains_retry_marker
 test_paseo_success_reconciles_boot_enabled_daemon
 test_paseo_daemon_runner_preserves_then_takes_over_detached_daemon
+test_paseo_daemon_runner_picks_foreground_command_by_version
 test_paseo_daemon_reload_failure_is_retryable
 test_paseo_success_marker_leaves_preinstalled_box_alone
 test_paseo_existing_gcp_reconciles_daemon_without_reinstall_and_aws_skips

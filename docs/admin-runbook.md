@@ -349,6 +349,10 @@ DEVBOX_RUNTIME_BUCKET=$(terraform -chdir=gcp output -raw runtime_bucket) \
   ```bash
   ssh dev@<key>-devbox sudo resize2fs /dev/disk/by-id/google-data
   ```
+  The *devbox disk nearly full (>90%)* alert emails `devbox_alert_email` per
+  machine and filesystem. Act on it: near 95% the dev gets `ENOSPC` (ext4
+  reserves 5% for root) and the Paseo daemon dies. Have the dev free space or
+  grow the disk.
 - **Change swap.** Change `swap_gib` in tfvars, `terraform -chdir=gcp apply` (an in-place instance-metadata update). It applies at the next converge, when `devbox-converge` reads `devbox-swap-gib` metadata and exports `DEVBOX_SWAP_SIZE_GIB` for `devbox-memory-hotfix` — never a rebuild. Force it now with `scripts/gcp/sync-converge.sh <key>`.
 - **Bump the Paseo pin.** New boxes install the exact
   `toolchain.paseo_cli_version` npm tarball, verified against
@@ -406,7 +410,9 @@ ssh dev@<key>-devbox '
 `paseo.service` on every run, even when Paseo itself is already installed.
 If a detached daemon is already running, the service leaves it alone
 and waits; it takes over foreground supervision when that process exits. After
-a reboot, systemd starts Paseo directly. To finish the handoff immediately,
+a reboot, systemd starts Paseo directly. It runs `paseo daemon run` on Paseo
+0.9.0 and later and `paseo daemon start --foreground` before that, checking
+`paseo --version` at each start, because an in-app update can cross that line. To finish the handoff immediately,
 run `paseo daemon stop`; the service begins managed startup on its next
 five-second poll, though Paseo can take longer to report ready. Once systemd
 owns the daemon, use `sudo systemctl restart paseo` for an explicit managed

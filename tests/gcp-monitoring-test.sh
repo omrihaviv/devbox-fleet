@@ -37,6 +37,15 @@ assert_contains 'var.devbox_alert_email == "" || length(local.machines) == 0 ? 0
 # Empty alert email disables channel + policy.
 assert_contains 'var.devbox_alert_email == "" ? 0 : 1'
 
+# Disk alert: a full data disk kills the Paseo daemon with ENOSPC, and ext4's
+# 5% root reserve means the dev hits ENOSPC at ~95%, so warn at 90%. Snap
+# squashfs loop devices always read 100% and must not match.
+assert_contains 'resource "google_monitoring_alert_policy" "disk_nearly_full"'
+assert_contains 'condition_threshold'
+assert_contains 'metric.type = \"agent.googleapis.com/disk/percent_used\" AND metric.labels.state = \"used\"'
+assert_contains 'NOT metric.labels.device = starts_with(\"/dev/loop\")'
+assert_contains 'threshold_value = 90'
+
 # Fleet dashboard: the per-process + host metrics investigation surface.
 assert_contains 'google_monitoring_dashboard'
 assert_contains 'agent.googleapis.com/memory/percent_used'

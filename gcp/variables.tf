@@ -317,7 +317,7 @@ variable "devbox_admins_group" {
 }
 
 variable "devbox_alert_email" {
-  description = "Email for converge-staleness alerts. Empty disables the notification channel + alert policy."
+  description = "Email for converge-staleness and disk-nearly-full alerts. Empty disables the notification channel + alert policies."
   type        = string
   default     = ""
 }
